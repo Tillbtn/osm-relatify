@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import replace
-from itertools import chain, cycle, islice, zip_longest
+from itertools import chain, cycle, groupby, islice, zip_longest
 from typing import NamedTuple
 
 import xmltodict
@@ -14,7 +14,7 @@ from config import CHANGESET_ID_PLACEHOLDER, CREATED_BY
 from cython_lib.geoutils import haversine_distance, radians_tuple
 from models.element_id import ElementId, element_id, split_element_id
 from models.fetch_relation import FetchRelationBusStopCollection, FetchRelationElement
-from models.final_route import FinalRoute
+from models.final_route import FinalRoute, FinalRouteSection
 from models.relation_member import RelationMember
 from openstreetmap import OpenStreetMap
 from overpass import Overpass, QueryParentsResult
@@ -191,6 +191,49 @@ def get_relation_members(relation: dict) -> list[RelationMember]:
     return [RelationMember(id=element_id(m['ref']), type=m['type'], role=m['role']) for m in relation['members']]
 
 
+def _bicycle_way_members(route: FinalRoute) -> list[RelationMember]:
+    """
+    Order the way members of a route with split sections and branches.
+
+    Split sections follow the JOSM/wiki convention: after the forward leg of a section comes its return leg,
+    both listed from the split point towards the merge point. Branches (e.g., alternative) come after the main route.
+    """
+    return_legs: dict[int | None, list[FinalRouteSection]] = defaultdict(list)
+    branches: list[FinalRouteSection] = []
+    for section in route.sections:
+        if section.role == 'backward':
+            return_legs[section.position].append(section)
+        else:
+            branches.append(section)
+
+    entries: list[tuple[ElementId, str]] = []
+
+    def add_return_legs(position: int | None) -> None:
+        for section in return_legs.pop(position, ()):
+            # the leg is in the direction of travel (merge -> split), list it from the split point
+            entries.extend((route_way.way.id, route_way.way.role) for route_way in reversed(section.ways))
+
+    for i, route_way in enumerate(route.ways):
+        add_return_legs(i)
+        entries.append((route_way.way.id, route_way.way.role))
+    add_return_legs(len(route.ways))
+
+    # return legs which could not be attached to the forward path
+    for position in sorted(return_legs, key=lambda p: (p is None, p or 0)):
+        add_return_legs(position)
+
+    for section in branches:
+        entries.extend((route_way.way.id, section.role) for route_way in section.ways)
+
+    members: list[RelationMember] = []
+    for role, group in groupby(entries, key=lambda entry: entry[1]):
+        members.extend(
+            RelationMember(id=way_id, type='way', role=role)
+            for way_id in _unsplit_way_ids([entry[0] for entry in group])
+        )
+    return members
+
+
 def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationMember], route_type: str) -> FinalRoute:
     id_relation_member_map = {member.id: member for member in relation_members}
 
@@ -207,6 +250,10 @@ def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationM
                 trailing_members.append(member)
             else:
                 members.append(member)
+
+        members.extend(_bicycle_way_members(route))
+        members.extend(trailing_members)
+        return replace(route, members=tuple(members))
 
     last_stop_member: RelationMember | None = None
     last_platform_member: RelationMember | None = None
@@ -257,7 +304,6 @@ def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationM
 
         members.append(RelationMember(id=way_id, type='way', role=role))
 
-    members.extend(trailing_members)
     return replace(route, members=tuple(members))
 
 
@@ -469,6 +515,7 @@ async def build_osm_change(
         id_way_map = dict(
             chain(
                 ((route_way.way.id, route_way.way) for route_way in route.ways),
+                ((route_way.way.id, route_way.way) for section in route.sections for route_way in section.ways),
                 ((way.id, way) for way in route.extraWaysToUpdate),
             )
         )

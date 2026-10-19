@@ -1,12 +1,27 @@
 import { updateBusStopsVisibility } from "./busStopsLayer.js"
 import { downloadTrigger } from "./downloadTriggers.js"
 import { map } from "./map.js"
+import { routeType } from "./menu.js"
+import { createElementFromHTML } from "./utils.js"
 import { showContextMenu, startWay, stopWay } from "./waysEndpoint.js"
 import { clearRangeStart, validateRangeStart } from "./waysRemoveRange.js"
 import { requestCalcBusRoute } from "./waysRoute.js"
 
 export let waysData = null
 export let waysRBush = null
+
+const editLegend = document.getElementById("edit-legend")
+
+// member way colors by role: main (both directions), forward/backward (one direction only, shown with arrows),
+// and branches (alternative, excursion, ...)
+const roleStyles = {
+    "": { name: "Main", color: "orangered", hoverColor: "darkred" },
+    forward: { name: "Forward", color: "#1e6fd9", hoverColor: "#0b3f85" },
+    backward: { name: "Backward", color: "#8e44ad", hoverColor: "#5b2c6f" },
+}
+const branchStyle = { color: "#2e8b57", hoverColor: "#1b5e20" }
+
+export const getRoleStyle = (role) => roleStyles[role ?? ""] ?? { name: role, ...branchStyle }
 
 // member ways are drawn above non-member ways, markers of short ways above both
 map.createPane("nonMemberWays").style.zIndex = 398
@@ -41,19 +56,19 @@ export function processRelationWaysData(fetchData) {
 
             if (waysData) {
                 for (const way of Object.values(waysData)) {
-                    const state = { member: way.member, memberRank: way.memberRank }
-                    memberMap.set(way.id, state)
-                    memberMap.set(way.id.split("_")[0], state)
+                    memberMap.set(way.id, way)
+                    memberMap.set(way.id.split("_")[0], way)
                 }
             }
 
             waysData = fetchData.ways
 
             for (const way of Object.values(waysData)) {
-                const state = memberMap.get(way.id) ?? memberMap.get(way.id.split("_")[0])
+                const previous = memberMap.get(way.id) ?? memberMap.get(way.id.split("_")[0])
 
-                way.member = state?.member || false
-                way.memberRank = way.member ? (state.memberRank ?? null) : null
+                way.member = previous?.member || false
+                way.memberRank = way.member ? (previous.memberRank ?? null) : null
+                way.role = previous?.role ?? way.role ?? ""
             }
         } else {
             waysData = fetchData.ways
@@ -131,9 +146,54 @@ function onWaysDataChanged() {
     validateRangeStart()
 
     updateWaysVisibility()
+    updateRoleLegend()
     updateBusStopsVisibility()
 
     requestCalcBusRoute()
+}
+
+function updateRoleLegend() {
+    const roles = new Set()
+
+    if (waysData && routeType === "bicycle") {
+        for (const way of Object.values(waysData)) {
+            if (way.member) roles.add(way.role ?? "")
+        }
+    }
+
+    // only show the legend when the route has split sections or branches
+    const visible = roles.size > 1 || (roles.size === 1 && !roles.has(""))
+    editLegend.classList.toggle("d-none", !visible)
+    editLegend.innerHTML = ""
+
+    if (!visible) return
+
+    // main, forward, backward, then the branches alphabetically
+    const rank = (role) => {
+        const index = ["", "forward", "backward"].indexOf(role)
+        return index === -1 ? 3 : index
+    }
+    const sortedRoles = [...roles].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+
+    for (const role of sortedRoles) {
+        const style = getRoleStyle(role)
+        const item = createElementFromHTML(`<span><span class="role-swatch"></span></span>`)
+        item.querySelector(".role-swatch").style.background = style.color
+        item.appendChild(document.createTextNode(style.name || role))
+        editLegend.appendChild(item)
+    }
+}
+
+// the role of a newly added way: the role of its connected member ways, if they all agree
+const inheritRole = (way) => {
+    const roles = new Set()
+
+    for (const connectedWayId of way.connectedTo) {
+        const connectedWay = waysData[connectedWayId]
+        if (connectedWay?.member) roles.add(connectedWay.role ?? "")
+    }
+
+    return roles.size === 1 ? [...roles][0] : ""
 }
 
 function updateWaysVisibility() {
@@ -175,13 +235,18 @@ function updateWaysVisibility() {
 const addWay = (way) => {
     if (idGroupMap.has(way.id)) return
 
-    const lineColor = way.member ? "orangered" : "#444"
-    const lineHoverColor = way.member ? "darkred" : "#000"
+    const roleStyle = getRoleStyle(way.role)
+    const lineColor = way.member ? roleStyle.color : "#444"
+    const lineHoverColor = way.member ? roleStyle.hoverColor : "#000"
     const lineWeight = way.member ? 7 : 5
     const opacity = way.member ? 1 : 0.55
     const renderer = way.member ? renderers.memberWays : renderers.nonMemberWays
 
-    const line = L.polyline(way.latLngs, {
+    // forward/backward ways are followed only along/against their direction: show it with arrows
+    const directional = way.member && (way.role === "forward" || way.role === "backward")
+    const lineLatLngs = way.role === "backward" && directional ? way.latLngs.slice().reverse() : way.latLngs
+
+    const line = L.polyline(lineLatLngs, {
         renderer: renderer,
         interactive: false,
         color: lineColor,
@@ -189,7 +254,7 @@ const addWay = (way) => {
         weight: lineWeight,
     })
 
-    if (way.oneway) {
+    if (way.oneway || directional) {
         line.arrowheads({
             size: `${Math.min(15, way.length * 0.6)}m`,
             frequency: way.length > 40 ? "40m" : "endonly",
@@ -232,6 +297,12 @@ const nextMemberRank = () => {
         if (way.member && way.memberRank != null) maxRank = Math.max(maxRank, way.memberRank)
     }
     return maxRank + 1
+}
+
+export const setWayRole = (wayId, role) => {
+    waysData[wayId].role = role
+    removeGroupFromLayers(wayId)
+    onWaysDataChanged()
 }
 
 export const removeMembersList = (wayIds) => {
@@ -385,6 +456,7 @@ map.on("click", (e) => {
 
     waysData[way.id].member = newMember
     waysData[way.id].memberRank = newMember ? nextMemberRank() : null
+    if (newMember) waysData[way.id].role = inheritRole(way)
     removeGroupFromLayers(way.id)
     onWaysDataChanged()
 

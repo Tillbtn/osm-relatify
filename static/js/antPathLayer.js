@@ -1,19 +1,16 @@
 import { map } from "./map.js"
 
-let antPath = null
+const antPathLayer = L.layerGroup().addTo(map)
 
 export function clearAntPath() {
-    if (antPath) {
-        antPath.removeFrom(map)
-        antPath = null
-    }
+    antPathLayer.clearLayers()
 }
 
-export function processRouteAntPath(route) {
-    clearAntPath()
+const addAntPath = (latLngs) => {
+    if (latLngs.length < 2) return
 
-    antPath = L.polyline
-        .antPath(route.latLngs, {
+    L.polyline
+        .antPath(latLngs, {
             delay: 3500,
             weight: 4,
             dashArray: [22, 20],
@@ -22,5 +19,17 @@ export function processRouteAntPath(route) {
             opacity: 0.75,
             interactive: false,
         })
-        .addTo(map)
+        .addTo(antPathLayer)
+}
+
+export function processRouteAntPath(route) {
+    clearAntPath()
+
+    // the main (forward) path
+    addAntPath(route.latLngs)
+
+    // backward sections and branches, animated in their direction of travel
+    for (const section of route.sections ?? []) {
+        addAntPath(section.latLngs)
+    }
 }

@@ -29,7 +29,9 @@ Please note that, for now, OSM Relatify only supports **bus**, **tram**, and **b
 
 - ✅ Bus routes
 - ✅ Tram routes
-- ✅ Bicycle routes (without `forward`/`backward` sections)
+- ✅ Bicycle routes
+- ✅ Split sections and oneway sections (`forward`/`backward` roles)
+- ✅ Branches (`alternative`, `excursion`, ...)
 - ✅ One-way roads
 - ✅ Roundabouts
 - ✅ Right-hand traffic
@@ -51,7 +53,6 @@ Please note that, for now, OSM Relatify only supports **bus**, **tram**, and **b
 - ⏳ `direction=*`
 - ⏳ `oneway=-1`
 - ⏳ Trolleybuses, trains, etc.
-- ⏳ Bicycle routes with `forward`/`backward` sections
 
 ### Unsupported
 

@@ -854,9 +854,9 @@ class Overpass:
         self,
         relation_id: int,
         osm_change: OsmChangeRelation | None,
-    ) -> tuple[list[int], dict[int, list[tuple[float, float]]]]:
+    ) -> tuple[list[tuple[int, str]], dict[int, list[tuple[float, float]]]]:
         """
-        Get the way members of the relation and the coordinates of their ways.
+        Get the way members (id, role) of the relation and the coordinates of their ways.
 
         With an osmChange file, the members and the geometry of its ways are taken from the file.
         """
@@ -866,18 +866,18 @@ class Overpass:
 
         if osm_change is None:
             relation = next(e for e in elements if e['type'] == 'relation' and e['id'] == relation_id)
-            members = [m['ref'] for m in relation['members'] if m['type'] == 'way']
+            members = [(m['ref'], m['role']) for m in relation['members'] if m['type'] == 'way']
         else:
-            members = [m.ref for m in osm_change.members if m.type == 'way']
+            members = [(m.ref, m.role) for m in osm_change.members if m.type == 'way']
             way_nodes.update(osm_change.ways)
 
-            missing_way_ids = {way_id for way_id in members if way_id > 0 and way_id not in way_nodes}
+            missing_way_ids = {way_id for way_id, _ in members if way_id > 0 and way_id not in way_nodes}
             for way in await self._get_elements_batched('ways', missing_way_ids):
                 way_nodes[way['id']] = way.get('nodes', ())
 
             missing_node_ids = {
                 node_id
-                for way_id in members
+                for way_id, _ in members
                 for node_id in way_nodes.get(way_id, ())
                 if node_id > 0 and node_id not in node_coords
             }
@@ -885,9 +885,10 @@ class Overpass:
                 if 'lat' in node:
                     node_coords[node['id']] = (node['lat'], node['lon'])
 
+        members = [(way_id, '' if role == 'route' else role) for way_id, role in members]
         way_coords = {
             way_id: coords
-            for way_id in members
+            for way_id, _ in members
             if (coords := [node_coords[n] for n in way_nodes.get(way_id, ()) if n in node_coords])
         }
         return members, way_coords
@@ -926,7 +927,7 @@ class Overpass:
 
             union_grid_cells = tuple(union_grid_cells_set)
         else:
-            # in merge mode, members are set by the client
+            # in merge mode, members (and their roles) are set by the client
             member_ways = []
 
             union_grid_cells = download_targets
@@ -974,10 +975,11 @@ class Overpass:
                     id_map.pop(way_id, None)
 
         member_ranks: dict[ElementId, int] = {}
+        member_roles: dict[ElementId, str] = {}
         # members of the osmChange file which are not available (anymore), e.g., deleted or not routable
         unmatched_way_ids: list[int] = []
 
-        for rank, way_id in enumerate(member_ways):
+        for rank, (way_id, role) in enumerate(member_ways):
             segment_ids = id_map.get(way_id)
             if not segment_ids:
                 if osm_change is not None and way_id not in unmatched_way_ids:
@@ -985,11 +987,13 @@ class Overpass:
                 continue
             for segment_id in segment_ids:
                 member_ranks.setdefault(segment_id, rank)
+                member_roles[segment_id] = role if route_type == 'bicycle' else ''
 
         ways = {
             e['id']: FetchRelationElement(
                 id=e['id'],
                 member=e['id'] in member_ranks,
+                role=member_roles.get(e['id'], ''),
                 oneway=e['_oneway'],
                 roundabout=e['_roundabout'],
                 nodes=e['nodes'],
