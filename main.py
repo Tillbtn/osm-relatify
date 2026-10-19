@@ -128,12 +128,14 @@ def logout():
 
 
 def get_route_type(tags: dict[str, str]) -> str | None:
-    if tags.get('public_transport:version') != '2':
-        return None
     type = tags.get('type')
     if type not in {'route', 'disused:route', 'was:route'}:
         return None
     type_specifier = tags.get(type)
+    if type_specifier == 'bicycle':
+        return 'bicycle'
+    if tags.get('public_transport:version') != '2':
+        return None
     if type_specifier == 'trolleybus':
         return 'bus'
     if type_specifier not in {'bus', 'tram'}:
@@ -178,7 +180,21 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
         relation_tags = relation.get('tags', {})
         route_type = get_route_type(relation_tags)
         if route_type is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Relation must be a PTv2 bus/tram/trolleybus route')
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, 'Relation must be a PTv2 bus/tram/trolleybus route or a bicycle route'
+            )
+
+        if route_type == 'bicycle':
+            # TODO: support split sections (forward/backward) and alternative/excursion branches
+            unsupported_roles = sorted(
+                {m['role'] for m in relation['members'] if m['type'] == 'way' and m['role'] not in {'', 'route'}}
+            )
+            if unsupported_roles:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    'Bicycle routes with split sections or branches are not supported yet '
+                    f'(found way roles: {", ".join(unsupported_roles)})',
+                )
 
         bounds, download_hist, download_triggers, ways, id_map, bus_stop_collections = await _OVERPASS.query_relation(
             relation_id=model.relationId,
@@ -273,12 +289,16 @@ async def post_calc_bus_route(ws: WebSocket, _=Depends(require_user_details)):
                 relation = get_task.result()
                 relation_members = get_relation_members(relation)
 
+                route_type = get_route_type(model.tags)
+                assert route_type is not None, 'Unsupported route type'
+
                 route = route_task.result()
                 route = replace(route, extraWaysToUpdate=tuple(ways_non_members.values()))
-                route = sort_and_upgrade_members(route, relation_members)
+                route = sort_and_upgrade_members(route, relation_members, route_type)
 
                 final_route = check_for_issues(
                     route=route,
+                    route_type=route_type,
                     ways=ways_members,
                     start_way=model.startWay,
                     end_way=model.stopWay,

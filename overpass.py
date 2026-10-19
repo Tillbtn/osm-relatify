@@ -51,6 +51,7 @@ def split_by_count(elements: Iterable[dict]) -> list[list[dict]]:
 
 
 def build_query(
+    relation_id: int,
     cell_bbs: Sequence[BoundingBox],
     cell_bbs_expanded: Sequence[BoundingBox],
     timeout: int,
@@ -134,11 +135,36 @@ def build_query(
             'out count;'
         )
 
+    if route_type == 'bicycle':
+        # bicycle routes have no stops
+        # sidewalks and crossings are only relevant if bicycles are explicitly allowed (or already members)
+        return (
+            f'[out:json][timeout:{timeout}];'
+            f'rel({relation_id})->.r;'
+            f'('
+            + ''.join(
+                f'way[highway][!footway]({bb});way[highway][footway][bicycle]({bb});way(r.r)({bb});' for bb in cell_bbs
+            )
+            + ');'
+            'out body qt;'
+            'out count;'
+            '>;'
+            'out skel qt;'
+            'out count;'
+            '(' + ''.join(f'node[highway=turning_circle]({bb});' for bb in cell_bbs) + ');'
+            'out tags qt;'
+            'out count;'
+            'way(r.r);'
+            'out ids qt;'
+            'out count;'
+        )
+
     raise NotImplementedError(f'Unsupported route type {route_type!r}')
 
 
 def build_map_elements_split(
     elements: Iterable[dict],
+    relation_way_ids: frozenset[int],
     cell_bbs: Sequence[BoundingBox],
     cell_bbs_expanded: Sequence[BoundingBox],
     route_type: str,
@@ -206,6 +232,8 @@ def build_map_elements_split(
             return 'highway' in tags and 'footway' not in tags
         if route_type == 'tram':
             return tags.get('railway') == 'tram'
+        if route_type == 'bicycle':
+            return ('highway' in tags and ('footway' not in tags or 'bicycle' in tags)) or way['id'] in relation_way_ids
         raise NotImplementedError(f'Unsupported route type {route_type!r}')
 
     road_ways = sorted(
@@ -230,6 +258,10 @@ def build_map_elements_split(
         ],
         [{'type': 'node', 'id': n['id'], 'tags': n['tags']} for n in turning_circles],
     ]
+
+    if route_type == 'bicycle':
+        result.append([{'type': 'way', 'id': way_id} for way_id in sorted(relation_way_ids)])
+        return result
 
     def is_stop(e: dict) -> bool:
         tags = e.get('tags')
@@ -387,10 +419,65 @@ def is_routable(tags: dict[str, str], route_type: str) -> bool:
         # all overpass-fetched elements are routable
         return True
 
+    if route_type == 'bicycle':
+        # be permissive: ways which are not routable can't be added to the route (current members are always kept)
+        highway_valid = tags['highway'] in {
+            'cycleway',
+            'residential',
+            'service',
+            'unclassified',
+            'tertiary',
+            'tertiary_link',
+            'secondary',
+            'secondary_link',
+            'primary',
+            'primary_link',
+            'trunk',
+            'trunk_link',
+            'living_street',
+            'road',
+            'track',
+            'path',
+            'busway',
+        }
+
+        highway_designated_valid = tags['highway'] in {
+            'footway',
+            'pedestrian',
+            'bridleway',
+            'steps',
+            'corridor',
+            'motorway',
+            'motorway_link',
+        }
+
+        access_designated = False
+        access_valid = True
+
+        if 'bicycle' in tags:
+            access_designated = tags['bicycle'] in {'yes', 'designated', 'permissive', 'dismount'}
+            access_valid = tags['bicycle'] not in {'no', 'private'}
+        elif 'vehicle' in tags:
+            access_valid = tags['vehicle'] not in {'private', 'no'}
+        elif 'access' in tags:
+            access_valid = tags['access'] not in {'private', 'no'}
+
+        motorroad_valid = tags.get('motorroad', 'no') in {'no'}
+        noarea_valid = tags.get('area', 'no') in {'no'}
+
+        return all(
+            (
+                (highway_valid or (highway_designated_valid and access_designated)),
+                (motorroad_valid or access_designated),
+                access_valid,
+                noarea_valid,
+            )
+        )
+
     raise NotImplementedError(f'Unsupported route type {route_type!r}')
 
 
-def is_oneway(tags: dict[str, str]) -> bool:
+def is_oneway(tags: dict[str, str], route_type: str) -> bool:
     # TODO: it would be nice to support oneway=-1
 
     roundabout_valid = False
@@ -400,7 +487,15 @@ def is_oneway(tags: dict[str, str]) -> bool:
 
     oneway_valid = roundabout_valid
 
-    if 'oneway:bus' in tags:
+    if route_type == 'bicycle':
+        if 'oneway:bicycle' in tags:
+            oneway_valid = tags['oneway:bicycle'] in {'yes'}
+        elif tags.get('cycleway', '').startswith('opposite'):
+            # deprecated contraflow tagging, equivalent to oneway:bicycle=no
+            oneway_valid = False
+        elif 'oneway' in tags:
+            oneway_valid = tags['oneway'] in {'yes'}
+    elif 'oneway:bus' in tags:
         oneway_valid = tags['oneway:bus'] in {'yes'}
     elif 'oneway:psv' in tags:
         oneway_valid = tags['oneway:psv'] in {'yes'}
@@ -606,6 +701,43 @@ def get_download_triggers(
     return dict(result)
 
 
+def build_route_bus_stop_collections(
+    elements_split: list[list[dict]],
+    route_type: str,
+    bbc: BoundingBoxCollection,
+) -> tuple[FetchRelationBusStopCollection, ...]:
+    bus_elements = elements_split[3]
+
+    stop_area_relations = elements_split[4]
+    stop_area_platform_elements = elements_split[5]
+    stop_area_stop_position_elements = elements_split[6]
+
+    merge_relations_tags(
+        stop_area_relations,
+        stop_area_platform_elements,
+        role='platform',
+        public_transport='platform',
+    )
+    merge_relations_tags(
+        stop_area_relations,
+        stop_area_stop_position_elements,
+        role='stop',
+        public_transport='stop_position',
+    )
+
+    elements_ex = chain(stop_area_platform_elements, stop_area_stop_position_elements, bus_elements)
+    elements_ex = preprocess_elements(elements_ex)
+    if route_type == 'bus':
+        elements_ex = (e for e in elements_ex if is_bus_explicit(e['tags']) or not is_any_rail_related(e['tags']))
+    elif route_type == 'tram':
+        elements_ex = (e for e in elements_ex if is_tram_element(e['tags']))
+
+    stops = tuple(FetchRelationBusStop.from_data(e) for e in elements_ex)
+    bus_stop_collections = build_bus_stop_collections(stops)
+    bus_stop_collections = tuple(c for c in bus_stop_collections if bbc.contains(c.best.latLng))
+    return bus_stop_collections
+
+
 # TODO: check data freshness
 class Overpass:
     def __init__(self, osm: OpenStreetMap):
@@ -641,13 +773,21 @@ class Overpass:
     async def _query_relation_history_map(
         self,
         session: str,  # cache busting  # noqa: ARG002
+        relation_id: int,
         cell_bbs: Sequence[BoundingBox],
         cell_bbs_expanded: Sequence[BoundingBox],
         route_type: str,
     ) -> list[list[dict]]:
+        if route_type == 'bicycle':
+            relation = await self._osm.get_relation(relation_id)
+            relation_way_ids = frozenset(m['ref'] for m in relation['members'] if m['type'] == 'way')
+        else:
+            relation_way_ids = frozenset()
+
         results = await asyncio.gather(*(self._download_map(bb) for bb in cell_bbs_expanded))
         return build_map_elements_split(
             chain.from_iterable(results),
+            relation_way_ids,
             cell_bbs,
             cell_bbs_expanded,
             route_type,
@@ -678,11 +818,11 @@ class Overpass:
 
             if DOWNLOAD_RELATION_SOURCE == 'osm':
                 elements_split = await self._query_relation_history_map(
-                    download_hist.session, cell_bbs, cell_bbs_expand, route_type
+                    download_hist.session, relation_id, cell_bbs, cell_bbs_expand, route_type
                 )
             else:
                 timeout = 180
-                query = build_query(cell_bbs, cell_bbs_expand, timeout, route_type)
+                query = build_query(relation_id, cell_bbs, cell_bbs_expand, timeout, route_type)
                 elements_split = await self._query_relation_history_post(download_hist.session, query, timeout)
 
             if all_elements_split is None:
@@ -757,33 +897,18 @@ class Overpass:
         turn_in_place_elements = elements_split[2]
         turn_in_place_elements = preprocess_elements(turn_in_place_elements)
 
-        bus_elements = elements_split[3]
-
-        stop_area_relations = elements_split[4]
-        stop_area_platform_elements = elements_split[5]
-        stop_area_stop_position_elements = elements_split[6]
-
-        merge_relations_tags(
-            stop_area_relations,
-            stop_area_platform_elements,
-            role='platform',
-            public_transport='platform',
+        # keep current members of bicycle routes regardless of tagging, e.g., dismount sections over steps
+        keep_way_ids = {e['id'] for e in elements_split[3]} if route_type == 'bicycle' else set()
+        road_elements = tuple(
+            e for e in maybe_road_elements if e['id'] in keep_way_ids or is_routable(e['tags'], route_type)
         )
-        merge_relations_tags(
-            stop_area_relations,
-            stop_area_stop_position_elements,
-            role='stop',
-            public_transport='stop_position',
-        )
-
-        road_elements = tuple(e for e in maybe_road_elements if is_routable(e['tags'], route_type))
 
         nodes_map = {e['id']: e for e in node_elements}
         turn_in_place_nodes = {e['id'] for e in turn_in_place_elements}
 
         for e in road_elements:
             e['_member'] = e['id'] in relation_way_members
-            e['_oneway'] = is_oneway(e['tags'])
+            e['_oneway'] = is_oneway(e['tags'], route_type)
             e['_roundabout'] = is_roundabout(e['tags'])
 
         road_elements, connected_ways_map, id_map = organize_ways(road_elements, turn_in_place_nodes)
@@ -803,16 +928,10 @@ class Overpass:
             for e in road_elements
         }
 
-        elements_ex = chain(stop_area_platform_elements, stop_area_stop_position_elements, bus_elements)
-        elements_ex = preprocess_elements(elements_ex)
-        if route_type == 'bus':
-            elements_ex = (e for e in elements_ex if is_bus_explicit(e['tags']) or not is_any_rail_related(e['tags']))
-        elif route_type == 'tram':
-            elements_ex = (e for e in elements_ex if is_tram_element(e['tags']))
-
-        stops = tuple(FetchRelationBusStop.from_data(e) for e in elements_ex)
-        bus_stop_collections = build_bus_stop_collections(stops)
-        bus_stop_collections = tuple(c for c in bus_stop_collections if bbc.contains(c.best.latLng))
+        if route_type == 'bicycle':
+            bus_stop_collections = ()
+        else:
+            bus_stop_collections = build_route_bus_stop_collections(elements_split, route_type, bbc)
 
         global_bb = BoundingBox(*bbc.idx.bounds)
         download_triggers = get_download_triggers(bbc, union_grid_cells, ways)

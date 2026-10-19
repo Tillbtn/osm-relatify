@@ -17,7 +17,7 @@ OSM Relatify is a user-friendly web application specifically designed for editin
 
 The application relies on the OSM data to be (more-or-less) accurately tagged. Incorrect or poor tagging may necessitate manual corrections using an OSM editor, like iD or JOSM.
 
-Please note that, for now, OSM Relatify only supports **bus** and **tram** relations.
+Please note that, for now, OSM Relatify only supports **bus**, **tram**, and **bicycle** relations.
 
 ## User documentation
 
@@ -29,6 +29,7 @@ Please note that, for now, OSM Relatify only supports **bus** and **tram** relat
 
 - ✅ Bus routes
 - ✅ Tram routes
+- ✅ Bicycle routes (without `forward`/`backward` sections)
 - ✅ One-way roads
 - ✅ Roundabouts
 - ✅ Right-hand traffic
@@ -50,6 +51,7 @@ Please note that, for now, OSM Relatify only supports **bus** and **tram** relat
 - ⏳ `direction=*`
 - ⏳ `oneway=-1`
 - ⏳ Trolleybuses, trains, etc.
+- ⏳ Bicycle routes with `forward`/`backward` sections
 
 ### Unsupported
 

@@ -90,6 +90,21 @@
       "object_types": ["relation"]
     },
     {
+      "key": "route",
+      "value": "bicycle",
+      "object_types": ["relation"]
+    },
+    {
+      "key": "disused:route",
+      "value": "bicycle",
+      "object_types": ["relation"]
+    },
+    {
+      "key": "was:route",
+      "value": "bicycle",
+      "object_types": ["relation"]
+    },
+    {
       "key": "name",
       "object_types": ["node", "relation", "way"]
     },
@@ -138,7 +153,7 @@
     {
       "key": "highway",
       "object_types": ["way"],
-      "description": "Used to determine whether the way is routable for buses/trolleybuses."
+      "description": "Used to determine whether the way is routable for buses/trolleybuses/bicycles."
     },
     {
       "key": "service",
@@ -168,24 +183,24 @@
     {
       "key": "access",
       "object_types": ["way"],
-      "description": "Used to determine whether the way is routable for buses/trolleybuses."
+      "description": "Used to determine whether the way is routable for buses/trolleybuses/bicycles."
     },
     {
       "key": "area",
       "object_types": ["way", "area"],
-      "description": "Used to determine whether the way is routable for buses/trolleybuses."
+      "description": "Used to determine whether the way is routable for buses/trolleybuses/bicycles."
     },
     {
       "key": "junction",
       "value": "roundabout",
       "object_types": ["way"],
-      "description": "Used to determine whether the way is routable for buses/trolleybuses."
+      "description": "Used to determine whether the way is routable for buses/trolleybuses/bicycles."
     },
     {
       "key": "oneway",
       "value": "yes",
       "object_types": ["way"],
-      "description": "Used to determine whether the way is routable for buses/trolleybuses."
+      "description": "Used to determine whether the way is routable for buses/trolleybuses/bicycles."
     },
     {
       "key": "oneway:bus",
@@ -198,6 +213,37 @@
       "value": "yes",
       "object_types": ["way"],
       "description": "Used to determine whether the way is routable for buses/trolleybuses."
+    },
+    {
+      "key": "bicycle",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
+    },
+    {
+      "key": "vehicle",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
+    },
+    {
+      "key": "motorroad",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
+    },
+    {
+      "key": "footway",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
+    },
+    {
+      "key": "oneway:bicycle",
+      "value": "yes",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
+    },
+    {
+      "key": "cycleway",
+      "object_types": ["way"],
+      "description": "Used to determine whether the way is routable for bicycles."
     }
   ]
 }

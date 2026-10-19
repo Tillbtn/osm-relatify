@@ -191,10 +191,23 @@ def get_relation_members(relation: dict) -> list[RelationMember]:
     return [RelationMember(id=element_id(m['ref']), type=m['type'], role=m['role']) for m in relation['members']]
 
 
-def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationMember]) -> FinalRoute:
+def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationMember], route_type: str) -> FinalRoute:
     id_relation_member_map = {member.id: member for member in relation_members}
 
     members: list[RelationMember] = []
+    trailing_members: list[RelationMember] = []
+
+    # routes without stops: keep other members (e.g., network nodes) before/after the ways, as they were
+    if route_type == 'bicycle':
+        seen_way = False
+        for member in relation_members:
+            if member.type == 'way':
+                seen_way = True
+            elif seen_way:
+                trailing_members.append(member)
+            else:
+                members.append(member)
+
     last_stop_member: RelationMember | None = None
     last_platform_member: RelationMember | None = None
 
@@ -244,6 +257,7 @@ def sort_and_upgrade_members(route: FinalRoute, relation_members: list[RelationM
 
         members.append(RelationMember(id=way_id, type='way', role=role))
 
+    members.extend(trailing_members)
     return replace(route, members=tuple(members))
 
 
