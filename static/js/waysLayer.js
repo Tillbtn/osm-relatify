@@ -1,22 +1,37 @@
 import { updateBusStopsVisibility } from "./busStopsLayer.js"
 import { downloadTrigger } from "./downloadTriggers.js"
-import { canvasRenderer, map } from "./map.js"
+import { map } from "./map.js"
 import { showContextMenu, startWay, stopWay } from "./waysEndpoint.js"
 import { requestCalcBusRoute } from "./waysRoute.js"
 
 export let waysData = null
 export let waysRBush = null
 
-map.createPane("nonMemberBuffers").style.zIndex = 394
-map.createPane("memberBuffers").style.zIndex = 395
-map.createPane("nonMemberBuffers2").style.zIndex = 396
-map.createPane("memberBuffers2").style.zIndex = 397
+// member ways are drawn above non-member ways, markers of short ways above both
 map.createPane("nonMemberWays").style.zIndex = 398
 map.createPane("memberWays").style.zIndex = 399
+map.createPane("shortWays").style.zIndex = 400
+
+const renderers = {
+    nonMemberWays: L.canvas({ padding: 0, pane: "nonMemberWays" }),
+    memberWays: L.canvas({ padding: 0, pane: "memberWays" }),
+    shortWays: L.canvas({ padding: 0, pane: "shortWays" }),
+}
 
 const waysLayer = L.layerGroup().addTo(map)
 
+// ways are picked by our own hit test instead of leaflet's: leaflet picks the way drawn last,
+// we pick the nearest one, so that short ways squeezed between long ones are selectable
+const hitTolerance = 12 // px
+// ways not much further away than the nearest one compete with it and the shortest one wins
+const hitTieTolerance = 3 // px
+// ways shorter than this on screen get a marker to make them visible and easy to hit
+const shortWayLength = 14 // px
+const shortWayRadius = 6 // px
+
 let idGroupMap = new Map()
+let hitRBush = null
+let hoveredWayId = null
 
 export function processRelationWaysData(fetchData) {
     if (fetchData) {
@@ -79,6 +94,34 @@ function createWaysRBush() {
     return tree
 }
 
+// segments of all drawn ways, used by the hit test
+function createHitRBush() {
+    if (idGroupMap.size === 0) return null
+
+    const segments = []
+
+    for (const { way } of idGroupMap.values()) {
+        for (let i = 0; i < way.latLngs.length - 1; i++) {
+            const start = way.latLngs[i]
+            const end = way.latLngs[i + 1]
+
+            segments.push({
+                minX: Math.min(start[0], end[0]),
+                minY: Math.min(start[1], end[1]),
+                maxX: Math.max(start[0], end[0]),
+                maxY: Math.max(start[1], end[1]),
+                wayId: way.id,
+                start: start,
+                end: end,
+            })
+        }
+    }
+
+    const tree = rbush()
+    tree.load(segments)
+    return tree
+}
+
 function onWaysDataChanged() {
     waysRBush = createWaysRBush()
 
@@ -91,7 +134,9 @@ function onWaysDataChanged() {
 function updateWaysVisibility() {
     if (!waysData) {
         idGroupMap = new Map()
+        hitRBush = null
         waysLayer.clearLayers()
+        setHoveredWay(null)
         return
     }
 
@@ -118,6 +163,8 @@ function updateWaysVisibility() {
             removeGroupFromLayers(wayId)
         }
     }
+
+    hitRBush = createHitRBush()
 }
 
 const addWay = (way) => {
@@ -127,27 +174,14 @@ const addWay = (way) => {
     const lineHoverColor = way.member ? "darkred" : "#000"
     const lineWeight = way.member ? 7 : 5
     const opacity = way.member ? 1 : 0.55
+    const renderer = way.member ? renderers.memberWays : renderers.nonMemberWays
 
     const line = L.polyline(way.latLngs, {
-        renderer: canvasRenderer,
+        renderer: renderer,
+        interactive: false,
         color: lineColor,
         opacity: opacity,
         weight: lineWeight,
-        pane: way.member ? "memberWays" : "nonMemberWays",
-    })
-
-    const buffer = L.polyline(way.latLngs, {
-        renderer: canvasRenderer,
-        color: "transparent",
-        weight: lineWeight + 18,
-        pane: way.member ? "memberBuffers" : "nonMemberBuffers",
-    })
-
-    const buffer2 = L.polyline(way.latLngs, {
-        renderer: canvasRenderer,
-        color: "transparent",
-        weight: lineWeight + 9,
-        pane: way.member ? "memberBuffers2" : "nonMemberBuffers2",
     })
 
     if (way.oneway) {
@@ -162,52 +196,33 @@ const addWay = (way) => {
         })
     }
 
-    const group = [line, buffer, buffer2]
+    const marker = L.circleMarker(way.midpoint, {
+        renderer: renderers.shortWays,
+        interactive: false,
+        radius: shortWayRadius,
+        color: lineHoverColor,
+        opacity: opacity,
+        weight: 2,
+        fillColor: lineColor,
+        fillOpacity: opacity,
+    })
 
-    const onClickHandler = () => {
-        if (way.id === startWay.id || way.id === stopWay.id) return
-
-        const newMember = !way.member
-
-        waysData[way.id].member = newMember
-        removeGroupFromLayers(way.id)
-        onWaysDataChanged()
-
-        if (newMember) downloadTrigger(way.id)
-    }
-
-    const onMouseOverHandler = () => {
-        line.setStyle({
-            color: lineHoverColor,
-            weight: lineWeight + 2,
-        })
-    }
-
-    const onMouseOutHandler = () => {
-        line.setStyle({
-            color: lineColor,
-            weight: lineWeight,
-        })
-    }
-
-    const onContextMenuHandler = (e) => {
-        showContextMenu(e, way)
-    }
-
-    for (const e of group) {
-        e.on("click", onClickHandler)
-        e.on("mouseover", onMouseOverHandler)
-        e.on("mouseout", onMouseOutHandler)
-
-        if (way.member) e.on("contextmenu", onContextMenuHandler)
+    const group = {
+        way: way,
+        line: line,
+        marker: marker,
+        lineColor: lineColor,
+        lineHoverColor: lineHoverColor,
+        lineWeight: lineWeight,
     }
 
     addGroupToLayers(way.id, group)
+    if (way.id === hoveredWayId) setGroupHovered(group, true)
 }
 
 export const removeMembersList = (wayIds) => {
     for (const wayId of wayIds) {
-        if (wayId === startWay.id || wayId === stopWay.id) continue
+        if (wayId === startWay?.id || wayId === stopWay?.id) continue
 
         waysData[wayId].member = false
         removeGroupFromLayers(wayId)
@@ -219,11 +234,8 @@ export const removeMembersList = (wayIds) => {
 const addGroupToLayers = (id, group) => {
     if (idGroupMap.has(id)) return
 
-    const [line, buffer, buffer2] = group
-
-    waysLayer.addLayer(buffer)
-    waysLayer.addLayer(buffer2)
-    waysLayer.addLayer(line)
+    waysLayer.addLayer(group.line)
+    updateShortWayMarker(group)
 
     idGroupMap.set(id, group)
 }
@@ -231,14 +243,146 @@ const addGroupToLayers = (id, group) => {
 const removeGroupFromLayers = (id) => {
     if (!idGroupMap.has(id)) return
 
-    const [line, buffer, buffer2] = idGroupMap.get(id)
+    const group = idGroupMap.get(id)
 
-    waysLayer.removeLayer(buffer)
-    waysLayer.removeLayer(buffer2)
-    waysLayer.removeLayer(line)
+    waysLayer.removeLayer(group.line)
+    waysLayer.removeLayer(group.marker)
 
     idGroupMap.delete(id)
 }
+
+const isShortOnScreen = (way) => {
+    let length = 0
+    let previous = map.latLngToLayerPoint(way.latLngs[0])
+
+    for (let i = 1; i < way.latLngs.length; i++) {
+        const current = map.latLngToLayerPoint(way.latLngs[i])
+        length += previous.distanceTo(current)
+        if (length >= shortWayLength) return false
+        previous = current
+    }
+
+    return true
+}
+
+const updateShortWayMarker = (group) => {
+    if (isShortOnScreen(group.way)) waysLayer.addLayer(group.marker)
+    else waysLayer.removeLayer(group.marker)
+}
+
+map.on("zoomend", () => {
+    for (const group of idGroupMap.values()) updateShortWayMarker(group)
+})
+
+// the nearest way within the tolerance, preferring shorter ways when several are about as near
+const findWayAt = (containerPoint) => {
+    if (!hitRBush) return null
+
+    const tolerance = L.point(hitTolerance, hitTolerance)
+    const corner1 = map.containerPointToLatLng(containerPoint.subtract(tolerance))
+    const corner2 = map.containerPointToLatLng(containerPoint.add(tolerance))
+
+    const segments = hitRBush.search({
+        minX: Math.min(corner1.lat, corner2.lat),
+        minY: Math.min(corner1.lng, corner2.lng),
+        maxX: Math.max(corner1.lat, corner2.lat),
+        maxY: Math.max(corner1.lng, corner2.lng),
+    })
+
+    const distances = new Map()
+
+    for (const segment of segments) {
+        const start = map.latLngToContainerPoint(segment.start)
+        const end = map.latLngToContainerPoint(segment.end)
+        const distance = L.LineUtil.pointToSegmentDistance(containerPoint, start, end)
+
+        if (distance > hitTolerance) continue
+
+        const previous = distances.get(segment.wayId)
+        if (previous === undefined || distance < previous) distances.set(segment.wayId, distance)
+    }
+
+    if (distances.size === 0) return null
+
+    const nearest = Math.min(...distances.values())
+    let best = null
+
+    for (const [wayId, distance] of distances) {
+        if (distance > nearest + hitTieTolerance) continue
+
+        const way = waysData[wayId]
+        if (!best || way.length < best.length) best = way
+    }
+
+    return best
+}
+
+const setGroupHovered = (group, hovered) => {
+    group.line.setStyle({
+        color: hovered ? group.lineHoverColor : group.lineColor,
+        weight: hovered ? group.lineWeight + 2 : group.lineWeight,
+    })
+
+    group.marker.setStyle({
+        fillColor: hovered ? group.lineHoverColor : group.lineColor,
+        radius: hovered ? shortWayRadius + 1 : shortWayRadius,
+    })
+}
+
+const setHoveredWay = (wayId) => {
+    if (wayId === hoveredWayId) return
+
+    const previous = idGroupMap.get(hoveredWayId)
+    if (previous) setGroupHovered(previous, false)
+
+    hoveredWayId = wayId
+
+    const current = idGroupMap.get(wayId)
+    if (current) setGroupHovered(current, true)
+
+    map.getContainer().style.cursor = current ? "pointer" : ""
+}
+
+// ignore events on markers, popups and tooltips: they handle their own clicks
+const isWayTarget = (target) =>
+    target.closest(".leaflet-map-pane") &&
+    !target.closest(".leaflet-marker-pane, .leaflet-popup-pane, .leaflet-tooltip-pane")
+
+// the hover listens to the dom directly: leaflet throttles mousemove over a canvas and may drop the last one
+L.DomEvent.on(map.getContainer(), "mousemove", (e) => {
+    if (map.dragging.moving()) return
+
+    const way = isWayTarget(e.target) ? findWayAt(map.mouseEventToContainerPoint(e)) : null
+    setHoveredWay(way?.id ?? null)
+})
+
+L.DomEvent.on(map.getContainer(), "mouseleave", () => setHoveredWay(null))
+map.on("dragstart", () => setHoveredWay(null))
+
+map.on("click", (e) => {
+    if (!isWayTarget(e.originalEvent.target)) return
+
+    const way = findWayAt(e.containerPoint)
+    if (!way) return
+    if (way.id === startWay?.id || way.id === stopWay?.id) return
+
+    const newMember = !way.member
+
+    waysData[way.id].member = newMember
+    removeGroupFromLayers(way.id)
+    onWaysDataChanged()
+
+    if (newMember) downloadTrigger(way.id)
+
+    setHoveredWay(findWayAt(e.containerPoint)?.id ?? null)
+})
+
+map.on("contextmenu", (e) => {
+    if (!isWayTarget(e.originalEvent.target)) return
+
+    const way = findWayAt(e.containerPoint)
+    if (way?.member) showContextMenu(e, way)
+})
 
 function fitToBounds(bounds) {
     const southWest = L.latLng(bounds.minlat, bounds.minlon)
