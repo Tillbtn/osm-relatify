@@ -1,24 +1,31 @@
+import asyncio
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
-from itertools import chain
+from itertools import chain, pairwise
 from typing import NamedTuple
 
-import xmltodict
 from asyncache import cached
 from cachetools import TTLCache
 from fastapi import HTTPException
+from httpx import HTTPStatusError
 from starlette import status
 
 from bus_collection_builder import build_bus_stop_collections
-from config import DOWNLOAD_RELATION_GRID_CELL_EXPAND, DOWNLOAD_RELATION_WAY_BB_EXPAND, OVERPASS_API_INTERPRETER
+from config import (
+    DOWNLOAD_RELATION_GRID_CELL_EXPAND,
+    DOWNLOAD_RELATION_MAP_CONCURRENCY,
+    DOWNLOAD_RELATION_SOURCE,
+    DOWNLOAD_RELATION_WAY_BB_EXPAND,
+    OVERPASS_API_INTERPRETER,
+)
 from models.bounding_box import BoundingBox
 from models.bounding_box_collection import BoundingBoxCollection
 from models.download_history import Cell, DownloadHistory
 from models.element_id import ElementId, element_id
 from models.fetch_relation import FetchRelationBusStop, FetchRelationBusStopCollection, FetchRelationElement
+from openstreetmap import OpenStreetMap
 from utils import HTTP
-from xmltodict_postprocessor import postprocessor
 
 # TODO: right hand side detection by querying roundabouts, and first/last bus stop
 
@@ -41,10 +48,6 @@ def split_by_count(elements: Iterable[dict]) -> list[list[dict]]:
 
     assert not current_split, 'Last element must be count type'
     return result
-
-
-def build_bb_query(relation_id: int, timeout: int) -> str:
-    return f'[out:json][timeout:{timeout}];rel({relation_id});way(r);out ids bb qt;'
 
 
 def build_query(
@@ -134,16 +137,191 @@ def build_query(
     raise NotImplementedError(f'Unsupported route type {route_type!r}')
 
 
-def build_parents_query(way_ids: Iterable[int], timeout: int) -> str:
-    def _parents(way_id: int) -> str:
-        return f'way({way_id});(rel(bw);.r;)->.r;'
+def build_map_elements_split(
+    elements: Iterable[dict],
+    cell_bbs: Sequence[BoundingBox],
+    cell_bbs_expanded: Sequence[BoundingBox],
+    route_type: str,
+) -> list[list[dict]]:
+    """
+    Emulate the result of build_query on raw OSM API map data.
 
-    return (
-        f'[out:xml][timeout:{timeout}];'
-        f'._->.r;' + ''.join(_parents(way_id) for way_id in way_ids) + '.r out meta qt;'
-        'way(r.r);'
-        'out skel qt;'
+    The filters must be kept in sync with build_query.
+    """
+    nodes: dict[int, dict] = {}
+    ways: dict[int, dict] = {}
+    relations: dict[int, dict] = {}
+    type_map = {'node': nodes, 'way': ways, 'relation': relations}
+
+    for e in elements:
+        type_map[e['type']][e['id']] = e
+
+    def nodes_within(bbs: Sequence[BoundingBox]) -> frozenset[int]:
+        return frozenset(n['id'] for n in nodes.values() if any(bb.contains(n['lat'], n['lon']) for bb in bbs))
+
+    cell_node_ids = nodes_within(cell_bbs)
+    expanded_node_ids = nodes_within(cell_bbs_expanded)
+
+    def is_within(e: dict, node_ids: frozenset[int], bbs: Sequence[BoundingBox]) -> bool:
+        if e['type'] == 'node':
+            return e['id'] in node_ids
+        if e['type'] == 'way':
+            if any(n in node_ids for n in e['nodes']):
+                return True
+            # like overpass, also match ways crossing the bounding box without a node inside
+            way_coords = tuple(coords(e))
+            return any(bb.intersects_segment(a, b) for a, b in pairwise(way_coords) for bb in bbs)
+        return any(
+            (m['type'] == 'node' and m['ref'] in node_ids)
+            or (m['type'] == 'way' and (w := ways.get(m['ref'])) is not None and is_within(w, node_ids, bbs))
+            for m in e['members']
+        )
+
+    def coords(e: dict) -> Iterator[tuple[float, float]]:
+        if e['type'] == 'node':
+            yield e['lat'], e['lon']
+        elif e['type'] == 'way':
+            for n in e['nodes']:
+                if (node := nodes.get(n)) is not None:
+                    yield node['lat'], node['lon']
+        else:
+            for m in e['members']:
+                if m['type'] != 'relation' and (member := type_map[m['type']].get(m['ref'])) is not None:
+                    yield from coords(member)
+
+    def out_tags_center(e: dict) -> dict | None:
+        tags = e.get('tags', {})
+        if e['type'] == 'node':
+            return {'type': 'node', 'id': e['id'], 'lat': e['lat'], 'lon': e['lon'], 'tags': tags}
+        e_coords = tuple(coords(e))
+        if not e_coords:
+            return None
+        lats, lons = zip(*e_coords)
+        center = {'lat': round((min(lats) + max(lats)) / 2, 7), 'lon': round((min(lons) + max(lons)) / 2, 7)}
+        return {'type': e['type'], 'id': e['id'], 'center': center, 'tags': tags}
+
+    def is_candidate_way(way: dict) -> bool:
+        tags = way.get('tags', {})
+        if route_type == 'bus':
+            return 'highway' in tags and 'footway' not in tags
+        if route_type == 'tram':
+            return tags.get('railway') == 'tram'
+        raise NotImplementedError(f'Unsupported route type {route_type!r}')
+
+    road_ways = sorted(
+        (w for w in ways.values() if is_candidate_way(w) and is_within(w, cell_node_ids, cell_bbs)),
+        key=lambda w: w['id'],
     )
+    road_node_ids = dict.fromkeys(chain.from_iterable(w['nodes'] for w in road_ways))
+    turning_circles = sorted(
+        (
+            n
+            for n in nodes.values()
+            if n['id'] in cell_node_ids and n.get('tags', {}).get('highway') == 'turning_circle'
+        ),
+        key=lambda n: n['id'],
+    )
+
+    result = [
+        [{'type': 'way', 'id': w['id'], 'nodes': w['nodes'], 'tags': w.get('tags', {})} for w in road_ways],
+        [
+            {'type': 'node', 'id': n['id'], 'lat': n['lat'], 'lon': n['lon']}
+            for n in (nodes[n_id] for n_id in road_node_ids if n_id in nodes)
+        ],
+        [{'type': 'node', 'id': n['id'], 'tags': n['tags']} for n in turning_circles],
+    ]
+
+    def is_stop(e: dict) -> bool:
+        tags = e.get('tags')
+        if not tags:
+            return False
+        is_node = e['type'] == 'node'
+        public_transport = tags.get('public_transport')
+        if route_type == 'bus':
+            return (
+                (is_node and tags.get('highway') == 'bus_stop' and public_transport == 'platform' and 'name' in tags)
+                or (
+                    tags.get('highway') == 'platform'
+                    and public_transport == 'platform'
+                    and ('name' in tags or 'ref' in tags)
+                )
+                or (is_node and public_transport == 'stop_position' and 'name' in tags)
+            )
+        if route_type == 'tram':
+            return (
+                (
+                    is_node
+                    and tags.get('railway') == 'tram_stop'
+                    and public_transport == 'stop_position'
+                    and 'name' in tags
+                )
+                or (
+                    tags.get('railway') == 'platform'
+                    and public_transport == 'platform'
+                    and ('name' in tags or 'ref' in tags)
+                )
+                or ('tram' in tags and public_transport == 'platform' and 'name' in tags)
+            )
+        raise NotImplementedError(f'Unsupported route type {route_type!r}')
+
+    stops = [
+        out
+        for e in chain(nodes.values(), ways.values(), relations.values())
+        if is_stop(e) and is_within(e, expanded_node_ids, cell_bbs_expanded) and (out := out_tags_center(e)) is not None
+    ]
+
+    stop_areas = sorted(
+        (
+            r
+            for r in relations.values()
+            if r.get('tags', {}).get('public_transport') == 'stop_area'
+            and is_within(r, expanded_node_ids, cell_bbs_expanded)
+        ),
+        key=lambda r: r['id'],
+    )
+    stop_area_platforms: dict[tuple[str, int], dict] = {}
+    stop_area_stops: dict[tuple[str, int], dict] = {}
+
+    for r in stop_areas:
+        for m in r['members']:
+            key = (m['type'], m['ref'])
+            if m['role'] == 'platform':
+                target = stop_area_platforms
+            elif m['role'] == 'stop' and m['type'] == 'node':
+                target = stop_area_stops
+            else:
+                continue
+            if key in target or (member := type_map[m['type']].get(m['ref'])) is None:
+                continue
+            if (out := out_tags_center(member)) is not None:
+                target[key] = out
+
+    def is_member_available(m: dict) -> bool:
+        key = (m['type'], m['ref'])
+        if m['role'] == 'platform':
+            return key in stop_area_platforms
+        if m['role'] == 'stop':
+            return key in stop_area_stops
+        return True
+
+    result.extend(
+        (
+            stops,
+            # members outside the downloaded area are unavailable, unlike with overpass
+            [
+                {
+                    'type': 'relation',
+                    'id': r['id'],
+                    'members': [m for m in r['members'] if is_member_available(m)],
+                    'tags': r.get('tags', {}),
+                }
+                for r in stop_areas
+            ],
+            list(stop_area_platforms.values()),
+            list(stop_area_stops.values()),
+        )
+    )
+    return result
 
 
 def is_routable(tags: dict[str, str], route_type: str) -> bool:
@@ -430,8 +608,9 @@ def get_download_triggers(
 
 # TODO: check data freshness
 class Overpass:
-    def __init__(self):
-        pass
+    def __init__(self, osm: OpenStreetMap):
+        self._osm = osm
+        self._map_semaphore = asyncio.Semaphore(DOWNLOAD_RELATION_MAP_CONCURRENCY)
 
     @cached(TTLCache(maxsize=1024, ttl=7200))  # 2 hours
     async def _query_relation_history_post(
@@ -444,6 +623,35 @@ class Overpass:
         r.raise_for_status()
         elements: list[dict] = r.json()['elements']
         return split_by_count(elements)
+
+    async def _download_map(self, bb: BoundingBox) -> list[dict]:
+        try:
+            async with self._map_semaphore:
+                return await self._osm.get_map(bb)
+        except HTTPStatusError as e:
+            # the area is too large or contains too many nodes
+            if e.response.status_code != status.HTTP_400_BAD_REQUEST or bb.maxlat - bb.minlat < 0.0005:
+                raise
+
+        print(f'[OSM] Splitting map download of {bb}')
+        results = await asyncio.gather(*(self._download_map(half) for half in bb.split()))
+        return list(chain.from_iterable(results))
+
+    @cached(TTLCache(maxsize=1024, ttl=7200))  # 2 hours
+    async def _query_relation_history_map(
+        self,
+        session: str,  # cache busting  # noqa: ARG002
+        cell_bbs: Sequence[BoundingBox],
+        cell_bbs_expanded: Sequence[BoundingBox],
+        route_type: str,
+    ) -> list[list[dict]]:
+        results = await asyncio.gather(*(self._download_map(bb) for bb in cell_bbs_expanded))
+        return build_map_elements_split(
+            chain.from_iterable(results),
+            cell_bbs,
+            cell_bbs_expanded,
+            route_type,
+        )
 
     async def _query_relation_history(
         self,
@@ -466,14 +674,20 @@ class Overpass:
             cell_bbs, cell_bbs_expand = cell_bbs_t
             all_bbs.extend(cell_bbs)
 
-            print(f'[OVERPASS] Downloading {len(cell_bbs)} cells for relation {relation_id}')
+            print(f'[{DOWNLOAD_RELATION_SOURCE.upper()}] Downloading {len(cell_bbs)} cells for relation {relation_id}')
 
-            timeout = 180
-            query = build_query(cell_bbs, cell_bbs_expand, timeout, route_type)
-            elements_split = await self._query_relation_history_post(download_hist.session, query, timeout)
+            if DOWNLOAD_RELATION_SOURCE == 'osm':
+                elements_split = await self._query_relation_history_map(
+                    download_hist.session, cell_bbs, cell_bbs_expand, route_type
+                )
+            else:
+                timeout = 180
+                query = build_query(cell_bbs, cell_bbs_expand, timeout, route_type)
+                elements_split = await self._query_relation_history_post(download_hist.session, query, timeout)
 
             if all_elements_split is None:
-                all_elements_split = elements_split
+                # copy, as the cached result must not be extended
+                all_elements_split = [list(elements) for elements in elements_split]
             else:
                 for i, elements in enumerate(elements_split):
                     all_elements_split[i].extend(elements)
@@ -498,26 +712,26 @@ class Overpass:
         list[FetchRelationBusStopCollection],
     ]:
         if download_targets is None:
-            timeout = 60
-            query = build_bb_query(relation_id, timeout)
-            r = await HTTP.post(OVERPASS_API_INTERPRETER, data={'data': query}, timeout=timeout * 2)
-            r.raise_for_status()
-
-            elements: list[dict] = r.json()['elements']
-            if not elements:
+            elements = await self._osm.get_relation_full(relation_id)
+            nodes_map = {e['id']: e for e in elements if e['type'] == 'node'}
+            member_way_ids = {
+                m['ref']
+                for e in elements
+                if e['type'] == 'relation' and e['id'] == relation_id
+                for m in e['members']
+                if m['type'] == 'way'
+            }
+            way_elements = [e for e in elements if e['type'] == 'way' and e['id'] in member_way_ids]
+            if not way_elements:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Relation is empty, which is not supported')
 
-            relation_way_members = {e['id'] for e in elements}
+            relation_way_members = {e['id'] for e in way_elements}
             union_grid_cells_set: set[Cell] = set()
 
-            for way in elements:
+            for way in way_elements:
+                lats, lons = zip(*((nodes_map[n]['lat'], nodes_map[n]['lon']) for n in way['nodes'] if n in nodes_map))
                 union_grid_cells_set.update(
-                    BoundingBox(
-                        minlat=way['bounds']['minlat'],
-                        minlon=way['bounds']['minlon'],
-                        maxlat=way['bounds']['maxlat'],
-                        maxlon=way['bounds']['maxlon'],
-                    )
+                    BoundingBox(minlat=min(lats), minlon=min(lons), maxlat=max(lats), maxlon=max(lons))
                     .extend(DOWNLOAD_RELATION_WAY_BB_EXPAND)
                     .get_grid_cells()
                 )
@@ -607,21 +821,12 @@ class Overpass:
 
     @cached(TTLCache(maxsize=128, ttl=60))
     async def query_parents(self, way_ids_set: frozenset[int]) -> QueryParentsResult:
-        timeout = 60
-        query = build_parents_query(way_ids_set, timeout)
-        r = await HTTP.post(OVERPASS_API_INTERPRETER, data={'data': query}, timeout=timeout * 2)
-        r.raise_for_status()
-
-        data: dict[str, list[dict]] = xmltodict.parse(
-            r.text,
-            postprocessor=postprocessor,
-            force_list=('relation', 'way', 'member', 'tag', 'nd'),
-        )['osm']
-
-        relations = data.get('relation', [])
+        relations_lists = await asyncio.gather(*(self._osm.get_way_relations(way_id) for way_id in way_ids_set))
+        # unique relations, the same object must be shared between ways, as it is modified in place for each split
+        all_relations = tuple({r['@id']: r for r in chain.from_iterable(relations_lists)}.values())
         id_relations_map = defaultdict(list)
 
-        for relation in relations:
+        for relation in all_relations:
             members = relation['member'] = relation.get('member', [])
             # tags = relation['tag'] = relation.get('tag', [])
 
@@ -636,7 +841,18 @@ class Overpass:
         for way_id, relations in id_relations_map.items():
             id_relations_map[way_id] = list({r['@id']: r for r in relations}.values())
 
-        ways = data.get('way', [])
+        # only the neighbors of the split ways are needed to determine the member order
+        neighbor_way_ids = set(way_ids_set)
+        for relation in all_relations:
+            members = relation['member']
+            for i, member in enumerate(members):
+                if member['@type'] != 'way' or member['@ref'] not in way_ids_set:
+                    continue
+                for j in (i - 1, i + 1):
+                    if 0 <= j < len(members) and members[j]['@type'] == 'way':
+                        neighbor_way_ids.add(members[j]['@ref'])
+
+        ways = await self._osm.get_ways_xml(sorted(neighbor_way_ids))
         ways_map = {w['@id']: w for w in ways}
 
         return QueryParentsResult(

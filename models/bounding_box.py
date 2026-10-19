@@ -16,6 +16,50 @@ class BoundingBox:
     def __str__(self) -> str:
         return f'{self.minlat:.6f},{self.minlon:.6f},{self.maxlat:.6f},{self.maxlon:.6f}'
 
+    def contains(self, lat: float, lon: float) -> bool:
+        return self.minlat <= lat <= self.maxlat and self.minlon <= lon <= self.maxlon
+
+    def intersects_segment(self, a: tuple[float, float], b: tuple[float, float]) -> bool:
+        """Check if the segment between the two lat/lon points intersects the bounding box (Liang-Barsky)."""
+        t0, t1 = 0.0, 1.0
+        dlat, dlon = b[0] - a[0], b[1] - a[1]
+
+        for p, q in (
+            (-dlat, a[0] - self.minlat),
+            (dlat, self.maxlat - a[0]),
+            (-dlon, a[1] - self.minlon),
+            (dlon, self.maxlon - a[1]),
+        ):
+            if p == 0:
+                if q < 0:
+                    return False
+                continue
+            t = q / p
+            if p < 0:
+                if t > t1:
+                    return False
+                t0 = max(t0, t)
+            else:
+                if t < t0:
+                    return False
+                t1 = min(t1, t)
+
+        return True
+
+    def split(self) -> tuple[Self, Self]:
+        """Split the bounding box into two halves along its longer side."""
+        if self.maxlat - self.minlat > self.maxlon - self.minlon:
+            midlat = (self.minlat + self.maxlat) / 2
+            return (
+                BoundingBox(minlat=self.minlat, minlon=self.minlon, maxlat=midlat, maxlon=self.maxlon),
+                BoundingBox(minlat=midlat, minlon=self.minlon, maxlat=self.maxlat, maxlon=self.maxlon),
+            )
+        midlon = (self.minlon + self.maxlon) / 2
+        return (
+            BoundingBox(minlat=self.minlat, minlon=self.minlon, maxlat=self.maxlat, maxlon=midlon),
+            BoundingBox(minlat=self.minlat, minlon=midlon, maxlat=self.maxlat, maxlon=self.maxlon),
+        )
+
     def extend(self, unit_meters: float | None = None, *, unit_degrees: float | None = None) -> Self:
         if unit_meters is not None:
             earth_radius = 6_371_000

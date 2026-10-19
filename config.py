@@ -36,6 +36,12 @@ CALC_ROUTE_MAX_PROCESSES = CALC_ROUTE_MAX_REQUESTS * CALC_ROUTE_N_PROCESSES
 
 CHANGESET_ID_PLACEHOLDER = f'__CHANGESET_ID_PLACEHOLDER__{secrets.token_urlsafe(8)}__'
 
+# Source of the relation surroundings: 'overpass' or 'osm' (OpenStreetMap API map calls, no server-side filtering)
+DOWNLOAD_RELATION_SOURCE = os.getenv('DOWNLOAD_RELATION_SOURCE', 'overpass').strip().lower()
+if DOWNLOAD_RELATION_SOURCE not in {'overpass', 'osm'}:
+    raise ValueError(f'Invalid DOWNLOAD_RELATION_SOURCE {DOWNLOAD_RELATION_SOURCE!r}, expected overpass or osm')
+DOWNLOAD_RELATION_MAP_CONCURRENCY = 4  # parallel OSM API map calls
+
 DOWNLOAD_RELATION_WAY_BB_EXPAND = 250  # meters
 DOWNLOAD_RELATION_GRID_SIZE = 0.01  # degrees
 DOWNLOAD_RELATION_GRID_CELL_EXPAND = 0.001  # degrees, only used for internal calculations, not sent to the user
