@@ -1,5 +1,6 @@
 from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import batched
 from typing import Literal
 
 import xmltodict
@@ -7,7 +8,17 @@ from asyncache import cached
 from cachetools import TTLCache
 
 from config import CHANGESET_ID_PLACEHOLDER, TAG_MAX_LENGTH
+from models.bounding_box import BoundingBox
 from utils import ensure_list, get_http_client
+from xmltodict_postprocessor import postprocessor
+
+
+def _parse_osm_xml(text: str) -> dict:
+    return xmltodict.parse(
+        text,
+        postprocessor=postprocessor,
+        force_list=('node', 'way', 'relation', 'member', 'tag', 'nd'),
+    )['osm']
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -72,6 +83,37 @@ class OpenStreetMap:
             return r.json()['elements']
         else:
             return ensure_list(xmltodict.parse(r.text)['osm'][elements_type[:-1]])
+
+    async def get_relation_full(self, relation_id: int) -> list[dict]:
+        """Get the relation with its direct members and all nodes of its member ways."""
+        r = await self._http.get(f'/0.6/relation/{relation_id}/full.json')
+        r.raise_for_status()
+        return r.json()['elements']
+
+    async def get_way_relations(self, way_id: int) -> list[dict]:
+        """Get the relations containing the way, as postprocessed XML dicts."""
+        r = await self._http.get(f'/0.6/way/{way_id}/relations')
+        r.raise_for_status()
+        return _parse_osm_xml(r.text).get('relation', [])
+
+    async def get_ways_xml(self, way_ids: Iterable[int]) -> list[dict]:
+        """Get the ways as postprocessed XML dicts."""
+        result = []
+        for chunk in batched(way_ids, 500, strict=False):
+            r = await self._http.get('/0.6/ways', params={'ways': ','.join(map(str, chunk))})
+            r.raise_for_status()
+            result.extend(_parse_osm_xml(r.text).get('way', []))
+        return result
+
+    async def get_map(self, bb: BoundingBox) -> list[dict]:
+        """Get all elements within the bounding box, including all nodes of the ways and the parent relations."""
+        r = await self._http.get(
+            '/0.6/map.json',
+            params={'bbox': f'{bb.minlon:.7f},{bb.minlat:.7f},{bb.maxlon:.7f},{bb.maxlat:.7f}'},
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.json()['elements']
 
     async def get_authorized_user(self) -> dict:
         r = await self._http.get('/0.6/user/details.json')

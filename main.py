@@ -54,7 +54,7 @@ _TEMPLATES = Jinja2Templates(directory='templates', auto_reload=TEST_ENV)
 
 _PROCESS_EXECUTOR = ProcessPoolExecutor(CALC_ROUTE_MAX_PROCESSES)
 _OSM = OpenStreetMap()
-_OVERPASS = Overpass()
+_OVERPASS = Overpass(_OSM)
 
 
 @asynccontextmanager
