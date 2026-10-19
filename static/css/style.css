@@ -89,6 +89,47 @@
   color: #333;
 }
 
+.role-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .15em .9em;
+  font-size: .85em;
+  color: #333;
+}
+
+.role-legend .role-swatch {
+  display: inline-block;
+  width: 1.4em;
+  height: .45em;
+  border-radius: 2px;
+  margin-right: .35em;
+  vertical-align: middle;
+}
+
+.popup-sm .popup-role {
+  border-top: 1px solid #ddd;
+  padding: .3em .5em;
+}
+
+.popup-sm .popup-role select {
+  width: auto;
+}
+
+.route-summary-sections {
+  font-size: .9em;
+  margin-bottom: .5em;
+}
+
+.route-summary-sections td:first-child {
+  padding-right: .75em;
+  text-transform: capitalize;
+}
+
+.route-summary-sections td:last-child {
+  text-align: right;
+  white-space: nowrap;
+}
+
 .warning {
   background: #f2f2f2;
   padding: 6px 6px 6px 10px;

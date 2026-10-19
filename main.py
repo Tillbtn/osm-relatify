@@ -29,7 +29,7 @@ from config import (
     TEST_ENV,
     WEBSITE,
 )
-from cython_lib.route import calc_bus_route
+from cython_lib.route import calc_bicycle_route, calc_bus_route
 from deflate_middleware import DeflateRoute
 from models.download_history import Cell, DownloadHistory
 from models.element_id import ElementId
@@ -184,18 +184,6 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
                 status.HTTP_400_BAD_REQUEST, 'Relation must be a PTv2 bus/tram/trolleybus route or a bicycle route'
             )
 
-        if route_type == 'bicycle':
-            # TODO: support split sections (forward/backward) and alternative/excursion branches
-            unsupported_roles = sorted(
-                {m['role'] for m in relation['members'] if m['type'] == 'way' and m['role'] not in {'', 'route'}}
-            )
-            if unsupported_roles:
-                raise HTTPException(
-                    status.HTTP_400_BAD_REQUEST,
-                    'Bicycle routes with split sections or branches are not supported yet '
-                    f'(found way roles: {", ".join(unsupported_roles)})',
-                )
-
         bounds, download_hist, download_triggers, ways, id_map, bus_stop_collections = await _OVERPASS.query_relation(
             relation_id=model.relationId,
             download_hist=download_hist,
@@ -204,7 +192,7 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
         )
 
     with print_run_time('Finding start/stop ways'):
-        start_way, stop_way = find_start_stop_ways(ways, id_map, relation)
+        start_way, stop_way = find_start_stop_ways(ways, id_map, relation, route_type)
 
     with print_run_time('Assigning members for stops'):
         bus_stop_collections = assign_none_members(bus_stop_collections, relation)
@@ -212,6 +200,7 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
     return FetchRelation(
         fetchMerge=len(download_hist.history) > 1 or model.reload,
         nameOrRef=relation_tags.get('name', relation_tags.get('ref', '')).strip(),
+        routeType=route_type,
         bounds=bounds,
         downloadHistory=download_hist,
         downloadTriggers=download_triggers,
@@ -265,34 +254,56 @@ async def post_calc_bus_route(ws: WebSocket, _=Depends(require_user_details)):
                     'All bus stops must be members of the relation'
                 )
 
+                route_type = get_route_type(model.tags)
+                assert route_type is not None, 'Unsupported route type'
+
                 try:
-                    async with asyncio.TaskGroup() as tg:
-                        get_task = tg.create_task(_OSM.get_relation(model.relationId))
-                        route_task = tg.create_task(
-                            asyncio.wait_for(
-                                calc_bus_route(
-                                    ways_members,
-                                    model.startWay,
-                                    model.stopWay,
-                                    model.busStops,
-                                    model.tags,
-                                    _PROCESS_EXECUTOR,
-                                    n_processes=CALC_ROUTE_N_PROCESSES,
-                                ),
-                                timeout=3,
-                            )
+                    if route_type == 'bicycle':
+                        # the current member order is used to orient the branches
+                        relation = await _OSM.get_relation(model.relationId)
+                        member_order: dict[int, int] = {}
+                        for i, member in enumerate(relation['members']):
+                            if member['type'] == 'way':
+                                member_order.setdefault(member['ref'], i)
+
+                        route = await asyncio.wait_for(
+                            calc_bicycle_route(
+                                ways_members,
+                                model.startWay,
+                                model.stopWay,
+                                model.tags,
+                                member_order,
+                                _PROCESS_EXECUTOR,
+                                n_processes=CALC_ROUTE_N_PROCESSES,
+                            ),
+                            timeout=6,  # up to three routes are calculated (forward, backward, branches)
                         )
+                    else:
+                        async with asyncio.TaskGroup() as tg:
+                            get_task = tg.create_task(_OSM.get_relation(model.relationId))
+                            route_task = tg.create_task(
+                                asyncio.wait_for(
+                                    calc_bus_route(
+                                        ways_members,
+                                        model.startWay,
+                                        model.stopWay,
+                                        model.busStops,
+                                        model.tags,
+                                        _PROCESS_EXECUTOR,
+                                        n_processes=CALC_ROUTE_N_PROCESSES,
+                                    ),
+                                    timeout=3,
+                                )
+                            )
+
+                        relation = get_task.result()
+                        route = route_task.result()
 
                 except TimeoutError as e:
                     raise HTTPException(status.HTTP_408_REQUEST_TIMEOUT, 'Route calculation timed out') from e
 
-                relation = get_task.result()
                 relation_members = get_relation_members(relation)
 
-                route_type = get_route_type(model.tags)
-                assert route_type is not None, 'Unsupported route type'
-
-                route = route_task.result()
                 route = replace(route, extraWaysToUpdate=tuple(ways_non_members.values()))
                 route = sort_and_upgrade_members(route, relation_members, route_type)
 

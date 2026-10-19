@@ -866,6 +866,13 @@ class Overpass:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Relation is empty, which is not supported')
 
             relation_way_members = {e['id'] for e in way_elements}
+            relation_way_roles = {
+                m['ref']: ('' if m['role'] == 'route' else m['role'])
+                for e in elements
+                if e['type'] == 'relation' and e['id'] == relation_id
+                for m in e['members']
+                if m['type'] == 'way'
+            }
             union_grid_cells_set: set[Cell] = set()
 
             for way in way_elements:
@@ -878,8 +885,9 @@ class Overpass:
 
             union_grid_cells = tuple(union_grid_cells_set)
         else:
-            # in merge mode, members are set by the client
+            # in merge mode, members (and their roles) are set by the client
             relation_way_members = set()
+            relation_way_roles = {}
 
             union_grid_cells = download_targets
 
@@ -908,6 +916,7 @@ class Overpass:
 
         for e in road_elements:
             e['_member'] = e['id'] in relation_way_members
+            e['_role'] = relation_way_roles.get(e['id'], '') if route_type == 'bicycle' else ''
             e['_oneway'] = is_oneway(e['tags'], route_type)
             e['_roundabout'] = is_roundabout(e['tags'])
 
@@ -917,6 +926,7 @@ class Overpass:
             e['id']: FetchRelationElement(
                 id=e['id'],
                 member=e['_member'],
+                role=e['_role'],
                 oneway=e['_oneway'],
                 roundabout=e['_roundabout'],
                 nodes=e['nodes'],

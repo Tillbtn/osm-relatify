@@ -1,17 +1,19 @@
 import asyncio
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from functools import partial
 from itertools import chain
+from math import inf
 from typing import NamedTuple, Self
 
 import cython
 
 from cython_lib.geoutils import haversine_distance
-from models.element_id import ElementId
+from models.element_id import ElementId, split_element_id
 from models.fetch_relation import FetchRelationBusStopCollection, FetchRelationElement
-from models.final_route import FinalRoute, FinalRouteWay
+from models.final_route import FinalRoute, FinalRouteSection, FinalRouteWay
 from relation_builder import SortedBusEntry, sort_bus_on_path
 from utils import print_run_time
 
@@ -150,6 +152,24 @@ class BestPathCollection(NamedTuple):
         )
 
 
+def _is_directional(way: FetchRelationElement) -> bool:
+    # the route follows the way only along (forward) or against (backward) its direction
+    return way.role in {'forward', 'backward'}
+
+
+def _can_enter_at_start(way: FetchRelationElement) -> bool:
+    # the role takes precedence over the oneway tag
+    if _is_directional(way):
+        return way.role == 'forward'
+    return True
+
+
+def _can_enter_at_end(way: FetchRelationElement) -> bool:
+    if _is_directional(way):
+        return way.role == 'backward'
+    return not way.oneway
+
+
 def build_graph(ways: dict[ElementId, FetchRelationElement]) -> dict[GraphKey, GraphValue]:
     convert_graph: dict[GraphKey, list[GraphKey]] = {}
 
@@ -163,21 +183,21 @@ def build_graph(ways: dict[ElementId, FetchRelationElement]) -> dict[GraphKey, G
                     continue
                 connected_start = connected_way.latLngs[0]
                 connected_end = connected_way.latLngs[-1]
-                if latlon == connected_start:
+                if latlon == connected_start and _can_enter_at_start(connected_way):
                     connections.append(GraphKey(connected_way_id, BOOL_START))
-                elif latlon == connected_end and not connected_way.oneway:
+                elif latlon == connected_end and _can_enter_at_end(connected_way):
                     connections.append(GraphKey(connected_way_id, BOOL_END))
             return connections
 
         # Build neighbors for START
         start_neighbors = find_connections_at(way.latLngs[0])
-        if way.turn_in_place_start and not way.oneway:
+        if way.turn_in_place_start and not way.oneway and not way.role:
             # U-turn at START: also connect to ways at END
             start_neighbors.extend(find_connections_at(way.latLngs[-1]))
 
         # Build neighbors for END
         end_neighbors = find_connections_at(way.latLngs[-1])
-        if way.turn_in_place_end:
+        if way.turn_in_place_end and not way.role:
             # U-turn at END: also connect to ways at START
             end_neighbors.extend(find_connections_at(way.latLngs[0]))
 
@@ -379,6 +399,11 @@ def modified_dfs_worker(
 
             for neighbor, neighbor_angle in valid_neighbors:
                 neighbor_way = ways[neighbor.way_id]
+
+                # directional ways (split sections) are used at most once, otherwise the path would loop through
+                # the return leg of a split section to cover more ways
+                if _is_directional(neighbor_way) and neighbor.way_id != end_way and neighbor.way_id in s.complete_path:
+                    continue
 
                 new_path = (*s.path, neighbor)
 
@@ -586,6 +611,13 @@ async def modified_dfs(
     return best_path.valid if best_path.valid.path else best_path.invalid
 
 
+def _path_latlngs(route_ways: Sequence[FinalRouteWay]) -> tuple[tuple[float, float], ...]:
+    route_latlons_gen = (
+        route_way.way.latLngs[::-1] if route_way.reversed_latLngs else route_way.way.latLngs for route_way in route_ways
+    )
+    return tuple(chain.from_iterable(latlons if i == 0 else latlons[1:] for i, latlons in enumerate(route_latlons_gen)))
+
+
 def finalize_route(
     best_path: BestPath,
     ways: dict[ElementId, FetchRelationElement],
@@ -600,14 +632,7 @@ def finalize_route(
         for key in best_path.path
     )
 
-    route_latlons_gen = (
-        route_way.way.latLngs[::-1] if route_way.reversed_latLngs else route_way.way.latLngs for route_way in route_ways
-    )
-
-    route_latlons = tuple(
-        chain.from_iterable(latlons if i == 0 else latlons[1:] for i, latlons in enumerate(route_latlons_gen))
-    )
-
+    route_latlons = _path_latlngs(route_ways)
     route_latlons_set = set(route_latlons)
 
     id_collection_map = {collection.best.id: collection for collection in bus_stop_collections}
@@ -665,3 +690,256 @@ async def calc_bus_route(
         )
 
     return finalize_route(best_path, ways_members, bus_stop_collections, tags)
+
+
+# --- routes without stops, with split sections (forward/backward) and branches (alternative, excursion, ...) ---
+
+
+def _endpoints_distance(way1: FetchRelationElement, way2: FetchRelationElement) -> float:
+    return min(
+        haversine_distance(latLng1, latLng2)
+        for latLng1 in (way1.latLngs[0], way1.latLngs[-1])
+        for latLng2 in (way2.latLngs[0], way2.latLngs[-1])
+    )
+
+
+def _graph_endpoint_ids(ways: Mapping[ElementId, FetchRelationElement]) -> list[ElementId]:
+    """Ways which are connected to at most one other way within the given graph."""
+    return [
+        way_id
+        for way_id, way in ways.items()
+        if sum(1 for connected_way_id in way.connectedTo if connected_way_id in ways) <= 1
+    ]
+
+
+def _pick_endpoint(target: FetchRelationElement, ways: Mapping[ElementId, FetchRelationElement]) -> ElementId:
+    """Pick the way to start/end at within the given graph: the target itself, or the nearest dead end."""
+    if target.id in ways:
+        return target.id
+    candidates = _graph_endpoint_ids(ways) or list(ways)
+    return min(candidates, key=lambda way_id: _endpoints_distance(target, ways[way_id]))
+
+
+def _connected_component(
+    seed: ElementId, ways: Mapping[ElementId, FetchRelationElement]
+) -> dict[ElementId, FetchRelationElement]:
+    component: dict[ElementId, FetchRelationElement] = {seed: ways[seed]}
+    stack = [seed]
+    while stack:
+        way_id = stack.pop()
+        for connected_way_id in ways[way_id].connectedTo:
+            if connected_way_id in ways and connected_way_id not in component:
+                component[connected_way_id] = ways[connected_way_id]
+                stack.append(connected_way_id)
+    return component
+
+
+def _entry_node(route_way: FinalRouteWay) -> int:
+    return route_way.way.nodes[-1] if route_way.reversed_latLngs else route_way.way.nodes[0]
+
+
+def _exit_node(route_way: FinalRouteWay) -> int:
+    return route_way.way.nodes[0] if route_way.reversed_latLngs else route_way.way.nodes[-1]
+
+
+async def _calc_path(
+    ways: dict[ElementId, FetchRelationElement],
+    start_way: ElementId,
+    end_way: ElementId,
+    executor: ProcessPoolExecutor,
+    n_processes: cython.int,
+) -> tuple[tuple[FinalRouteWay, ...], bool]:
+    """Calculate the best path from start_way to end_way, returns the path and whether the end was reached."""
+    graph = build_graph(ways)
+    best_path = await modified_dfs(graph, ways, start_way, end_way, {}, executor, n_processes)
+    route_ways = tuple(
+        FinalRouteWay(
+            way=ways[key.way_id],
+            reversed_latLngs=not key.is_start,
+        )
+        for key in best_path.path
+    )
+    complete = bool(route_ways) and route_ways[-1].way.id == end_way
+    return route_ways, complete
+
+
+async def _calc_component_path(
+    component: dict[ElementId, FetchRelationElement],
+    candidates: Sequence[tuple[ElementId, ElementId]],
+    executor: ProcessPoolExecutor,
+    n_processes: cython.int,
+) -> tuple[FinalRouteWay, ...]:
+    """Route a connected component, trying the given (start, end) pairs: the first complete path wins, else the longest."""
+    best: tuple[FinalRouteWay, ...] = ()
+    for start_way, end_way in candidates:
+        path, complete = await _calc_path(component, start_way, end_way, executor, n_processes)
+        if complete:
+            return path
+        if len(path) > len(best):
+            best = path
+    return best or (FinalRouteWay(way=component[candidates[0][0]], reversed_latLngs=False),)
+
+
+async def _calc_branch_sections(
+    role: str,
+    branch_ways: dict[ElementId, FetchRelationElement],
+    order_key,
+    executor: ProcessPoolExecutor,
+    n_processes: cython.int,
+) -> list[FinalRouteSection]:
+    """
+    Sort the ways of a branch role (e.g., alternative) into one or more sections.
+
+    Each connected component becomes a section, routed from its first to its last endpoint (by order_key).
+    Ways left over by the routing form additional sections, so that no way is lost.
+    """
+    sections: list[FinalRouteSection] = []
+    remaining = dict(branch_ways)
+
+    while remaining:
+        seed = min(remaining, key=order_key)
+        component = _connected_component(seed, remaining)
+        endpoints = sorted(_graph_endpoint_ids(component), key=order_key)
+
+        if len(endpoints) >= 2:
+            candidates = [(endpoints[0], endpoints[-1])]
+        elif endpoints:
+            candidates = [(endpoints[0], endpoints[0])]
+        else:
+            candidates = [(seed, seed)]
+
+        path = await _calc_component_path(component, candidates, executor, n_processes)
+        sections.append(FinalRouteSection(role=role, ways=path, latLngs=_path_latlngs(path)))
+
+        for route_way in path:
+            remaining.pop(route_way.way.id, None)
+
+    return sections
+
+
+async def _calc_return_legs(
+    directional_ways: dict[ElementId, FetchRelationElement],
+    forward_path: Sequence[FinalRouteWay],
+    executor: ProcessPoolExecutor,
+    n_processes: cython.int,
+) -> list[FinalRouteSection]:
+    """
+    Sort the directional ways which are not used by the forward path into the return legs of split sections.
+
+    Each leg is routed in its direction of travel (merge point -> split point) and attached to the forward path
+    at its split point: the leg is listed after the forward leg, see FinalRouteSection.position.
+    """
+    # the junction nodes of the forward path: junctions[i] is the node before forward_path[i]
+    junctions: list[int] = [_entry_node(forward_path[0])] if forward_path else []
+    junctions.extend(_exit_node(route_way) for route_way in forward_path)
+
+    def find_position(leg: Sequence[FinalRouteWay]) -> int | None:
+        split_node = _exit_node(leg[-1])
+        merge_node = _entry_node(leg[0])
+        for i, node in enumerate(junctions):
+            if node != split_node:
+                continue
+            for j in range(i + 1, len(junctions)):
+                if junctions[j] == merge_node:
+                    return j
+            return None
+        return None
+
+    sections: list[FinalRouteSection] = []
+    remaining = dict(directional_ways)
+
+    while remaining:
+        seed = next(iter(remaining))
+        component = _connected_component(seed, remaining)
+        endpoints = _graph_endpoint_ids(component)[:4]
+
+        # the direction of travel is given by the roles: try the endpoints in both orders
+        candidates = [(a, b) for a in endpoints for b in endpoints if a != b] or [(seed, seed)]
+        path = await _calc_component_path(component, candidates, executor, n_processes)
+
+        sections.append(
+            FinalRouteSection(role='backward', ways=path, latLngs=_path_latlngs(path), position=find_position(path))
+        )
+
+        for route_way in path:
+            remaining.pop(route_way.way.id, None)
+
+    return sections
+
+
+async def calc_bicycle_route(
+    ways_members: dict[ElementId, FetchRelationElement],
+    start_way: ElementId,
+    end_way: ElementId,
+    tags: dict[str, str],
+    member_order: Mapping[int, int],
+    executor: ProcessPoolExecutor,
+    n_processes: cython.int,
+) -> FinalRoute:
+    """
+    Calculate a route without stops, supporting split sections and branches (by way role).
+
+    Ways with the forward/backward role are followed only along/against their direction (see Relation:route).
+    The forward path is routed over the main and directional ways, from start_way to end_way.
+    The directional ways which are left over form the return legs of split sections.
+    Each other role (e.g., alternative, excursion) is routed on its own, into one or more sections.
+    """
+    route_ways: dict[ElementId, FetchRelationElement] = {}
+    branch_role_ways: dict[str, dict[ElementId, FetchRelationElement]] = defaultdict(dict)
+    for way_id, way in ways_members.items():
+        if way.role in {'', 'forward', 'backward'}:
+            route_ways[way_id] = way
+        else:
+            branch_role_ways[way.role][way_id] = way
+
+    if not route_ways:
+        # nothing to route: treat everything as the main route
+        route_ways = ways_members
+        branch_role_ways = {}
+
+    def native_id(way_id: ElementId) -> int:
+        return split_element_id(way_id).id
+
+    origin_latlng = ways_members[start_way].latLngs[0]
+
+    def order_key(way_id: ElementId) -> tuple[float, float]:
+        # prefer the current relation order, fallback to the distance from the route start
+        return (
+            member_order.get(native_id(way_id), inf),
+            haversine_distance(origin_latlng, ways_members[way_id].midpoint),
+        )
+
+    def role_order_key(role: str) -> tuple[float, str]:
+        return min((member_order.get(native_id(way_id), inf) for way_id in branch_role_ways[role]), default=inf), role
+
+    with print_run_time('Calculating route'):
+        branch_tasks = [
+            asyncio.ensure_future(_calc_branch_sections(role, branch_role_ways[role], order_key, executor, n_processes))
+            for role in sorted(branch_role_ways, key=role_order_key)
+        ]
+
+        forward_path, _ = await _calc_path(
+            route_ways,
+            _pick_endpoint(ways_members[start_way], route_ways),
+            _pick_endpoint(ways_members[end_way], route_ways),
+            executor,
+            n_processes,
+        )
+
+        used_way_ids = {route_way.way.id for route_way in forward_path}
+        directional_ways = {
+            way_id: way  #
+            for way_id, way in route_ways.items()
+            if way_id not in used_way_ids and _is_directional(way)
+        }
+        return_legs = await _calc_return_legs(directional_ways, forward_path, executor, n_processes)
+
+        branch_sections = await asyncio.gather(*branch_tasks)
+
+    return FinalRoute(
+        ways=forward_path,
+        latLngs=_path_latlngs(forward_path),
+        busStops=(),
+        tags=tags,
+        sections=(*return_legs, *chain.from_iterable(branch_sections)),
+    )

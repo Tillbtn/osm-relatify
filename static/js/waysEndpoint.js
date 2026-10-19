@@ -1,5 +1,18 @@
 import { map, openInOpenStreetMap } from "./map.js"
+import { routeType } from "./menu.js"
+import { setWayRole } from "./waysLayer.js"
 import { requestCalcBusRoute } from "./waysRoute.js"
+
+// well-known way roles of bicycle routes, see https://wiki.openstreetmap.org/wiki/Relation:route
+const wayRoles = [
+    ["", "main (both directions)"],
+    ["forward", "forward (along the way only)"],
+    ["backward", "backward (against the way only)"],
+    ["alternative", "alternative"],
+    ["excursion", "excursion"],
+    ["approach", "approach"],
+    ["connection", "connection"],
+]
 
 let startMarker = null
 let stopMarker = null
@@ -89,11 +102,35 @@ function clearPopup() {
     }
 }
 
+const escapeHtml = (text) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`)
+
+const createRoleSelectHtml = (way) => {
+    if (routeType !== "bicycle" || !way.member) return ""
+
+    const currentRole = way.role ?? ""
+    const roles = wayRoles.some(([role]) => role === currentRole) ? wayRoles : [...wayRoles, [currentRole, currentRole]]
+    const options = roles
+        .map(
+            ([role, name]) =>
+                `<option value="${escapeHtml(role)}"${role === currentRole ? " selected" : ""}>${escapeHtml(name)}</option>`,
+        )
+        .join("")
+
+    return `
+            <div class="popup-role d-flex align-items-center justify-content-between">
+                <label class="form-label mb-0 me-2 small" for="ep-role">Role</label>
+                <select class="form-select form-select-sm" id="ep-role" title="The role of this way in the relation">
+                    ${options}
+                </select>
+            </div>`
+}
+
 export function showContextMenu(e, way) {
     clearPopup()
 
     popup = L.popup(e.latlng, {
         content: `
+            <div>
             <div class="btn-group text-center">
                 <button class="btn btn-sm btn-light d-flex flex-column align-items-center" id="ep-set-start">
                     <img class="mb-1" src="/static/img/start.webp" width="24" alt="Start icon">
@@ -107,6 +144,7 @@ export function showContextMenu(e, way) {
                     <img class="mb-1" src="/static/img/brands/openstreetmap.webp" width="24" alt="OpenStreetMap logo">
                     <div>Inspect</div>
                 </button>
+            </div>${createRoleSelectHtml(way)}
             </div>`,
         closeButton: false,
         className: "popup-sm",
@@ -115,6 +153,14 @@ export function showContextMenu(e, way) {
     const setStartButton = document.getElementById("ep-set-start")
     const setStopButton = document.getElementById("ep-set-stop")
     const openOsmButton = document.getElementById("ep-open-osm")
+    const roleSelect = document.getElementById("ep-role")
+
+    if (roleSelect) {
+        roleSelect.onchange = () => {
+            setWayRole(way.id, roleSelect.value)
+            popup.close()
+        }
+    }
 
     setStartButton.onclick = () => {
         setStartMarker(way)

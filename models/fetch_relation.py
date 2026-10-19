@@ -53,6 +53,10 @@ class FetchRelationElement:  # more like FetchRelationWay
     turn_in_place_start: bool
     turn_in_place_end: bool
 
+    # relation member role, only used by routes without stops (e.g., bicycle)
+    # '' main, 'forward'/'backward' split sections, anything else is a branch (e.g., 'alternative')
+    role: str = ''
+
     # automatically calculated
     length: float = None
     midpoint: tuple[float, float] = None
@@ -138,6 +142,7 @@ class FetchRelationBusStopCollection:
 class FetchRelation:
     fetchMerge: bool
     nameOrRef: str
+    routeType: str
     bounds: BoundingBox
     downloadHistory: DownloadHistory
     downloadTriggers: dict[ElementId, tuple[Cell, ...]]
@@ -152,14 +157,20 @@ def find_start_stop_ways(
     ways: dict[ElementId, FetchRelationElement],
     id_map: dict[int, list[ElementId]],
     relation: dict,
+    route_type: str,
 ) -> tuple[FetchRelationElement, FetchRelationElement]:
-    member_ids = [
-        way['ref']
-        for way in relation['members']
-        if way['type'] == 'way' and way['role'] in {'', 'forward', 'backward', 'route'}
-    ]
+    # the start/stop points of bicycle routes apply to the forward direction: main and forward ways only
+    candidate_roles = {'', 'forward', 'route'} if route_type == 'bicycle' else {'', 'forward', 'backward', 'route'}
+
+    member_ids = [way['ref'] for way in relation['members'] if way['type'] == 'way' and way['role'] in candidate_roles]
+
+    if not member_ids:
+        member_ids = [way['ref'] for way in relation['members'] if way['type'] == 'way']
 
     assert member_ids, 'Relation has no way members'
+
+    def is_candidate(way: FetchRelationElement) -> bool:
+        return way.member and (route_type != 'bicycle' or way.role in candidate_roles)
 
     def get_endpoint_id(way_id: int, neighbor_way_id: int | None) -> ElementId | None:
         all_way_ids = id_map[way_id]
@@ -175,7 +186,7 @@ def find_start_stop_ways(
         for endpoint_way_id in endpoint_way_ids:
             endpoint_way = ways[endpoint_way_id]
 
-            if sum(1 for connected_way_id in endpoint_way.connectedTo if ways[connected_way_id].member) <= 1:
+            if sum(1 for connected_way_id in endpoint_way.connectedTo if is_candidate(ways[connected_way_id])) <= 1:
                 return endpoint_way_id
 
         # both endpoints connect to other members (e.g., roundtrip): prefer the one away from the neighbor member

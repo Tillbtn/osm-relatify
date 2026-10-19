@@ -26,6 +26,7 @@ const submitDownloadBtn = document.querySelector("#view-submit .btn-download")
 
 export let relationId = null
 export let relationTags = null
+export let routeType = null
 let activeView = "load"
 
 const switchView = (name) => {
@@ -111,6 +112,7 @@ export const processFetchRelationData = (data) => {
 
 export const processRelationTags = (data) => {
     relationTags = data.tags
+    routeType = data.routeType
 
     const dummyDiv = document.createElement("div")
 
@@ -168,7 +170,7 @@ export const processRouteWarnings = (data) => {
             }
 
             editWarnings.appendChild(child)
-        } else if (warning.message === "Some stops are far away" || warning.message === "Some stops are not reached") {
+        } else if (warning.extra?.length > 0) {
             const child = createElementFromHTML(`
             <div class="warning warning-${severityText}">
                 <div class="warning-message">${warning.message}</div>
@@ -178,10 +180,17 @@ export const processRouteWarnings = (data) => {
             </div>`)
 
             child.querySelector("button.primary").onclick = () => {
-                // show me
-                const stopId = warning.extra[0]
+                // show me: the extra is either a way id or a stop id
+                const id = warning.extra[0]
+                const way = waysData[id]
+
+                if (way) {
+                    map.setView(way.midpoint, 19)
+                    return
+                }
+
                 const stop = busStopData.find(
-                    (c) => (c.platform && c.platform.id === stopId) || (c.stop && c.stop.id === stopId),
+                    (c) => (c.platform && c.platform.id === id) || (c.stop && c.stop.id === id),
                 )
 
                 if (stop)
@@ -274,14 +283,47 @@ const styleStopName = (name) => {
     })
 }
 
+const formatLength = (meters) => (meters >= 1000 ? `${(meters / 1000).toFixed(1)} km` : `${Math.round(meters)} m`)
+
+const sumWaysLength = (routeWays) => routeWays.reduce((total, routeWay) => total + routeWay.way.length, 0)
+
+// summary of a route without stops: the main path, the return legs of its split sections and its branches
+const createRouteSectionsSummary = (data) => {
+    const rows = [["Route", data.ways.length, sumWaysLength(data.ways)]]
+    const sectionsByRole = new Map()
+
+    for (const section of data.sections ?? []) {
+        const name = section.role === "backward" ? "Return legs" : section.role
+        const entry = sectionsByRole.get(name) ?? [0, 0, 0]
+        entry[0] += 1
+        entry[1] += section.ways.length
+        entry[2] += sumWaysLength(section.ways)
+        sectionsByRole.set(name, entry)
+    }
+
+    for (const [name, [count, waysCount, length]] of sectionsByRole) {
+        rows.push([`${name} (${count})`, waysCount, length])
+    }
+
+    const table = createElementFromHTML(`<table class="route-summary-sections"><tbody></tbody></table>`)
+    const tbody = table.querySelector("tbody")
+
+    for (const [name, waysCount, length] of rows) {
+        const row = createElementFromHTML(`<tr><td></td><td></td></tr>`)
+        row.children[0].textContent = name
+        row.children[1].textContent = `${waysCount} ways · ${formatLength(length)}`
+        tbody.appendChild(row)
+    }
+
+    return table
+}
+
 export const processRouteStops = (data) => {
     routeSummary.innerHTML = ""
     routeSummaryHint.classList.toggle("d-none", data.busStops.length === 0)
 
     if (data.busStops.length === 0) {
-        routeSummary.appendChild(
-            createElementFromHTML(`<div class="text-center text-muted small mb-2">This route has no stops.</div>`),
-        )
+        routeSummary.appendChild(createRouteSectionsSummary(data))
         return
     }
 
