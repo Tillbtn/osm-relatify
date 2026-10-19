@@ -161,7 +161,7 @@ def find_start_stop_ways(
 
     assert member_ids, 'Relation has no way members'
 
-    def get_endpoint_id(way_id: int) -> ElementId | None:
+    def get_endpoint_id(way_id: int, neighbor_way_id: int | None) -> ElementId | None:
         all_way_ids = id_map[way_id]
 
         if not all_way_ids:
@@ -170,16 +170,29 @@ def find_start_stop_ways(
         if len(all_way_ids) == 1:
             return all_way_ids[0]
 
-        for endpoint_way_id in [all_way_ids[0], all_way_ids[-1]]:
+        endpoint_way_ids = (all_way_ids[0], all_way_ids[-1])
+
+        for endpoint_way_id in endpoint_way_ids:
             endpoint_way = ways[endpoint_way_id]
 
             if sum(1 for connected_way_id in endpoint_way.connectedTo if ways[connected_way_id].member) <= 1:
                 return endpoint_way_id
 
+        # both endpoints connect to other members (e.g., roundtrip): prefer the one away from the neighbor member
+        if neighbor_way_id is not None:
+            neighbor_way_ids = set(id_map.get(neighbor_way_id, ()))
+            away_way_ids = [
+                endpoint_way_id
+                for endpoint_way_id in endpoint_way_ids
+                if neighbor_way_ids.isdisjoint(ways[endpoint_way_id].connectedTo)
+            ]
+            if len(away_way_ids) == 1:
+                return away_way_ids[0]
+
         return all_way_ids[len(all_way_ids) // 2]
 
     for i in range(len(member_ids)):
-        start_way_id = get_endpoint_id(member_ids[i])
+        start_way_id = get_endpoint_id(member_ids[i], member_ids[i + 1] if i + 1 < len(member_ids) else None)
 
         if start_way_id is not None:
             break
@@ -187,7 +200,7 @@ def find_start_stop_ways(
         start_way_id = None
 
     for i in range(len(member_ids) - 1, -1, -1):
-        stop_way_id = get_endpoint_id(member_ids[i])
+        stop_way_id = get_endpoint_id(member_ids[i], member_ids[i - 1] if i > 0 else None)
 
         if stop_way_id is not None:
             break
