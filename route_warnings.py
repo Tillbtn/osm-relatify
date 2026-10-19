@@ -96,6 +96,7 @@ def _check_for_members_unchanged(route: FinalRoute, relation_members: list[Relat
 @trace
 def check_for_issues(
     route: FinalRoute,
+    route_type: str,
     ways: dict[ElementId, FetchRelationElement],
     start_way: ElementId,  # noqa: ARG001
     end_way: ElementId,
@@ -107,7 +108,7 @@ def check_for_issues(
         _check_for_end_not_reached(route, end_way),
         _check_for_bus_stop_far_away(route, bus_stop_collections),
         _check_for_bus_stop_not_reached(route, bus_stop_collections),
-        _check_for_not_enough_bus_stops(route),
+        _check_for_not_enough_bus_stops(route) if route_type != 'bicycle' else None,
         _check_for_roundtrip_not_roundtrip(route),
         _check_for_members_unchanged(route, relation_members),
     )

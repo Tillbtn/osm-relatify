@@ -22,6 +22,7 @@ const editWarnings = document.getElementById("edit-warnings")
 const editSubmitBtn = document.querySelector("#view-edit .btn-next")
 const sumitBackBtn = document.querySelector("#view-submit .btn-back")
 const routeSummary = document.getElementById("route-summary")
+const routeSummaryHint = document.getElementById("route-summary-hint")
 const submitUploadBtn = document.querySelector("#view-submit .btn-upload")
 const submitDownloadBtn = document.querySelector("#view-submit .btn-download")
 
@@ -325,6 +326,14 @@ const styleStopName = (name) => {
 
 export const processRouteStops = (data) => {
     routeSummary.innerHTML = ""
+    routeSummaryHint.classList.toggle("d-none", data.busStops.length === 0)
+
+    if (data.busStops.length === 0) {
+        routeSummary.appendChild(
+            createElementFromHTML(`<div class="text-center text-muted small mb-2">This route has no stops.</div>`),
+        )
+        return
+    }
 
     for (const collection of data.busStops) {
         const isPlatform = collection.platform != null
