@@ -2,6 +2,7 @@ import { updateBusStopsVisibility } from "./busStopsLayer.js"
 import { downloadTrigger } from "./downloadTriggers.js"
 import { canvasRenderer, map } from "./map.js"
 import { showContextMenu, startWay, stopWay } from "./waysEndpoint.js"
+import { clearRangeStart, validateRangeStart } from "./waysRemoveRange.js"
 import { requestCalcBusRoute } from "./waysRoute.js"
 
 export let waysData = null
@@ -39,6 +40,7 @@ export function processRelationWaysData(fetchData) {
             }
         } else {
             waysData = fetchData.ways
+            clearRangeStart()
         }
     } else waysData = null
 
@@ -81,6 +83,7 @@ function createWaysRBush() {
 
 function onWaysDataChanged() {
     waysRBush = createWaysRBush()
+    validateRangeStart()
 
     updateWaysVisibility()
     updateBusStopsVisibility()
