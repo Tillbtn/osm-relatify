@@ -1,4 +1,5 @@
 import { map, openInOpenStreetMap } from "./map.js"
+import { clearRangeStart, rangeStartWay, removeRangeTo, setRangeStart } from "./waysRemoveRange.js"
 import { requestCalcBusRoute } from "./waysRoute.js"
 
 let startMarker = null
@@ -89,6 +90,22 @@ function clearPopup() {
     }
 }
 
+const scissorsIcon = `
+    <svg class="mb-1" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#dc3545" stroke-width="2"
+        stroke-linecap="round" aria-hidden="true">
+        <circle cx="6" cy="6" r="3" />
+        <circle cx="6" cy="18" r="3" />
+        <line x1="8.5" y1="7.5" x2="20" y2="18" />
+        <line x1="8.5" y1="16.5" x2="20" y2="6" />
+    </svg>`
+
+// the label of the "from - to" removal button: start a range, finish it, or cancel it
+const removeRangeLabel = (way) => {
+    if (!rangeStartWay) return "Remove <b>FROM</b>"
+    if (rangeStartWay.id === way.id) return "Cancel <b>REMOVE</b>"
+    return "Remove <b>TO</b>"
+}
+
 export function showContextMenu(e, way) {
     clearPopup()
 
@@ -103,6 +120,10 @@ export function showContextMenu(e, way) {
                     <img class="mb-1" src="/static/img/finish.webp" width="24" alt="Finish icon">
                     <div>Set <b>END</b></div>
                 </button>
+                <button class="btn btn-sm btn-light d-flex flex-column align-items-center" id="ep-remove-range">
+                    ${scissorsIcon}
+                    <div>${removeRangeLabel(way)}</div>
+                </button>
                 <button class="btn btn-sm btn-light d-flex flex-column align-items-center" id="ep-open-osm">
                     <img class="mb-1" src="/static/img/brands/openstreetmap.webp" width="24" alt="OpenStreetMap logo">
                     <div>Inspect</div>
@@ -114,6 +135,7 @@ export function showContextMenu(e, way) {
 
     const setStartButton = document.getElementById("ep-set-start")
     const setStopButton = document.getElementById("ep-set-stop")
+    const removeRangeButton = document.getElementById("ep-remove-range")
     const openOsmButton = document.getElementById("ep-open-osm")
 
     setStartButton.onclick = () => {
@@ -123,6 +145,13 @@ export function showContextMenu(e, way) {
 
     setStopButton.onclick = () => {
         setStopMarker(way)
+        popup.close()
+    }
+
+    removeRangeButton.onclick = () => {
+        if (!rangeStartWay) setRangeStart(way)
+        else if (rangeStartWay.id === way.id) clearRangeStart()
+        else removeRangeTo(way)
         popup.close()
     }
 
