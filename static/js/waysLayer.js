@@ -41,17 +41,19 @@ export function processRelationWaysData(fetchData) {
 
             if (waysData) {
                 for (const way of Object.values(waysData)) {
-                    memberMap.set(way.id, way.member)
-                    memberMap.set(way.id.split("_")[0], way.member)
+                    const state = { member: way.member, memberRank: way.memberRank }
+                    memberMap.set(way.id, state)
+                    memberMap.set(way.id.split("_")[0], state)
                 }
             }
 
             waysData = fetchData.ways
 
             for (const way of Object.values(waysData)) {
-                const memberCandidates = [memberMap.get(way.id), memberMap.get(way.id.split("_")[0])]
+                const state = memberMap.get(way.id) ?? memberMap.get(way.id.split("_")[0])
 
-                way.member = memberCandidates.find((m) => m !== undefined) || false
+                way.member = state?.member || false
+                way.memberRank = way.member ? (state.memberRank ?? null) : null
             }
         } else {
             waysData = fetchData.ways
@@ -223,11 +225,21 @@ const addWay = (way) => {
     if (way.id === hoveredWayId) setGroupHovered(group, true)
 }
 
+// added ways go to the end of the member order, the route calculation uses it to orient loops
+const nextMemberRank = () => {
+    let maxRank = -1
+    for (const way of Object.values(waysData)) {
+        if (way.member && way.memberRank != null) maxRank = Math.max(maxRank, way.memberRank)
+    }
+    return maxRank + 1
+}
+
 export const removeMembersList = (wayIds) => {
     for (const wayId of wayIds) {
         if (wayId === startWay?.id || wayId === stopWay?.id) continue
 
         waysData[wayId].member = false
+        waysData[wayId].memberRank = null
         removeGroupFromLayers(wayId)
     }
 
@@ -372,6 +384,7 @@ map.on("click", (e) => {
     const newMember = !way.member
 
     waysData[way.id].member = newMember
+    waysData[way.id].memberRank = newMember ? nextMemberRank() : null
     removeGroupFromLayers(way.id)
     onWaysDataChanged()
 

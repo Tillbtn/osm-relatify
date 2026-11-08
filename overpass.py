@@ -848,22 +848,23 @@ class Overpass:
                     # e.g., the OSM data has changed since the file was created
                     id_map.pop(way_id, None)
 
-        member_way_ids: set[ElementId] = set()
+        member_ranks: dict[ElementId, int] = {}
         # members of the osmChange file which are not available (anymore), e.g., deleted or not routable
         unmatched_way_ids: list[int] = []
 
-        for way_id in member_ways:
+        for rank, way_id in enumerate(member_ways):
             segment_ids = id_map.get(way_id)
             if not segment_ids:
                 if osm_change is not None and way_id not in unmatched_way_ids:
                     unmatched_way_ids.append(way_id)
                 continue
-            member_way_ids.update(segment_ids)
+            for segment_id in segment_ids:
+                member_ranks.setdefault(segment_id, rank)
 
         ways = {
             e['id']: FetchRelationElement(
                 id=e['id'],
-                member=e['id'] in member_way_ids,
+                member=e['id'] in member_ranks,
                 oneway=e['_oneway'],
                 roundabout=e['_roundabout'],
                 nodes=e['nodes'],
@@ -871,6 +872,7 @@ class Overpass:
                 connectedTo=list(connected_ways_map[e['id']]),
                 turn_in_place_start=e['_turn_in_place_start'],
                 turn_in_place_end=e['_turn_in_place_end'],
+                memberRank=member_ranks.get(e['id']),
             )
             for e in road_elements
         }

@@ -62,6 +62,9 @@ class StackElement(NamedTuple):
     loop_length: float = 0
     after_finish_length: float = 0
     roundabout_enter: GraphKey | None = None
+    # the member rank of the last newly visited way, and how often the path went against the member order
+    rank_last: int = -1
+    rank_inversions: int = 0
 
 
 class BestPath(NamedTuple):
@@ -73,6 +76,7 @@ class BestPath(NamedTuple):
     complete_path: set[ElementId]
     complete_length: float
     angle_sum: float
+    rank_inversions: int
 
     @classmethod
     def zero(cls) -> Self:
@@ -85,6 +89,7 @@ class BestPath(NamedTuple):
             complete_path=set(),
             complete_length=0,
             angle_sum=0,
+            rank_inversions=0,
         )
 
     def select_best(self, other: Self) -> Self:
@@ -130,13 +135,24 @@ class BestPath(NamedTuple):
         if length_diff > 0:
             return self
 
+        # follow the member order, e.g., drive a loop in the direction in which its ways were added
+        if other.rank_inversions < self.rank_inversions:
+            return other
+        if other.rank_inversions > self.rank_inversions:
+            return self
+
         # simpler angles
         if self.angle_sum > other.angle_sum:
             return other
         if self.angle_sum < other.angle_sum:
             return self
 
-        return self  # paths are equal
+        # equal paths: decide deterministically, independent of which worker found a path first
+        self_key = tuple((key.way_id, key.is_start) for key in self.path)
+        other_key = tuple((key.way_id, key.is_start) for key in other.path)
+        if other_key < self_key:
+            return other
+        return self
 
 
 class BestPathCollection(NamedTuple):
@@ -337,6 +353,7 @@ def modified_dfs_worker(
                 complete_path=s.complete_path,
                 complete_length=s.complete_length,
                 angle_sum=s.angle_sum,
+                rank_inversions=s.rank_inversions,
             )
 
             if current_key.way_id == end_way:
@@ -406,10 +423,18 @@ def modified_dfs_worker(
                 if new_length > max_length:
                     continue
 
+                new_rank_last = s.rank_last
+                new_rank_inversions = s.rank_inversions
+
                 if neighbor_way.id not in s.complete_path:
                     new_complete_path = s.complete_path.copy()
                     new_complete_path.add(neighbor_way.id)
                     new_complete_length = s.complete_length + neighbor_way.length
+
+                    if neighbor_way.memberRank is not None:
+                        if neighbor_way.memberRank < s.rank_last:
+                            new_rank_inversions += 1
+                        new_rank_last = neighbor_way.memberRank
                 else:
                     new_complete_path = s.complete_path
                     new_complete_length = s.complete_length
@@ -463,6 +488,8 @@ def modified_dfs_worker(
                         loop_length=new_loop_length,
                         after_finish_length=new_after_finish_length,
                         roundabout_enter=new_roundabout_enter,
+                        rank_last=new_rank_last,
+                        rank_inversions=new_rank_inversions,
                     )
                 )
 
@@ -499,6 +526,7 @@ async def modified_dfs(
             length=ways[start_way].length,
             complete_path={key.way_id},
             complete_length=ways[start_way].length,
+            rank_last=ways[start_way].memberRank if ways[start_way].memberRank is not None else -1,
         )
 
     stack: list[StackElement] = [

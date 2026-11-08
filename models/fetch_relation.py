@@ -52,6 +52,9 @@ class FetchRelationElement:  # more like FetchRelationWay
     connectedTo: list[ElementId]
     turn_in_place_start: bool
     turn_in_place_end: bool
+    # the position in the member order (relation members first, then ways in the order they were added),
+    # used to choose the direction of loops when both directions are equally good
+    memberRank: int | None = None
 
     # automatically calculated
     length: float = None
