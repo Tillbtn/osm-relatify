@@ -1,5 +1,5 @@
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import pairwise
 from typing import Self
@@ -146,6 +146,8 @@ class FetchRelation:
     stopWay: FetchRelationElement
     ways: dict[ElementId, FetchRelationElement]
     busStops: list[FetchRelationBusStopCollection]
+    # member ways of a loaded osmChange file which are not available (anymore), e.g., changed or deleted on OSM
+    unmatchedWays: list[int] = field(default_factory=list)
 
 
 def find_start_stop_ways(

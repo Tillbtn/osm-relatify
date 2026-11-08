@@ -2,8 +2,8 @@ import asyncio
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
-from itertools import chain, pairwise
-from typing import NamedTuple
+from itertools import batched, chain, pairwise
+from typing import Literal, NamedTuple
 
 from asyncache import cached
 from cachetools import TTLCache
@@ -24,6 +24,7 @@ from models.bounding_box_collection import BoundingBoxCollection
 from models.download_history import Cell, DownloadHistory
 from models.element_id import ElementId, element_id
 from models.fetch_relation import FetchRelationBusStop, FetchRelationBusStopCollection, FetchRelationElement
+from models.osm_change import OsmChangeRelation, build_endpoint_index, match_way_segments
 from openstreetmap import OpenStreetMap
 from utils import HTTP
 
@@ -696,6 +697,61 @@ class Overpass:
 
         return all_elements_split, bbc
 
+    async def _get_elements_batched(self, elements_type: Literal['nodes', 'ways'], ids: Iterable[int]) -> list[dict]:
+        get = self._osm.get_nodes if elements_type == 'nodes' else self._osm.get_ways
+        result = []
+        for chunk in batched(sorted(ids), 500, strict=False):
+            try:
+                result.extend(await get(chunk))
+            except HTTPStatusError as e:
+                # at least one of the elements does not exist
+                if e.response.status_code != status.HTTP_404_NOT_FOUND:
+                    raise
+                print(f'🚧 Warning: Some {elements_type} could not be fetched: {chunk}')
+        return result
+
+    async def _get_member_ways(
+        self,
+        relation_id: int,
+        osm_change: OsmChangeRelation | None,
+    ) -> tuple[list[int], dict[int, list[tuple[float, float]]]]:
+        """
+        Get the way members of the relation and the coordinates of their ways.
+
+        With an osmChange file, the members and the geometry of its ways are taken from the file.
+        """
+        elements = await self._osm.get_relation_full(relation_id)
+        node_coords = {e['id']: (e['lat'], e['lon']) for e in elements if e['type'] == 'node'}
+        way_nodes: dict[int, Sequence[int]] = {e['id']: e['nodes'] for e in elements if e['type'] == 'way'}
+
+        if osm_change is None:
+            relation = next(e for e in elements if e['type'] == 'relation' and e['id'] == relation_id)
+            members = [m['ref'] for m in relation['members'] if m['type'] == 'way']
+        else:
+            members = [m.ref for m in osm_change.members if m.type == 'way']
+            way_nodes.update(osm_change.ways)
+
+            missing_way_ids = {way_id for way_id in members if way_id > 0 and way_id not in way_nodes}
+            for way in await self._get_elements_batched('ways', missing_way_ids):
+                way_nodes[way['id']] = way.get('nodes', ())
+
+            missing_node_ids = {
+                node_id
+                for way_id in members
+                for node_id in way_nodes.get(way_id, ())
+                if node_id > 0 and node_id not in node_coords
+            }
+            for node in await self._get_elements_batched('nodes', missing_node_ids):
+                if 'lat' in node:
+                    node_coords[node['id']] = (node['lat'], node['lon'])
+
+        way_coords = {
+            way_id: coords
+            for way_id in members
+            if (coords := [node_coords[n] for n in way_nodes.get(way_id, ()) if n in node_coords])
+        }
+        return members, way_coords
+
     @cached(TTLCache(maxsize=128, ttl=60))
     async def query_relation(
         self,
@@ -703,6 +759,7 @@ class Overpass:
         download_hist: DownloadHistory | None,
         download_targets: Sequence[Cell] | None,
         route_type: str,  # bus, tram...
+        osm_change: OsmChangeRelation | None = None,
     ) -> tuple[
         BoundingBox,
         DownloadHistory,
@@ -710,26 +767,17 @@ class Overpass:
         dict[ElementId, FetchRelationElement],
         dict[int, list[ElementId]],
         list[FetchRelationBusStopCollection],
+        list[int],
     ]:
         if download_targets is None:
-            elements = await self._osm.get_relation_full(relation_id)
-            nodes_map = {e['id']: e for e in elements if e['type'] == 'node'}
-            member_way_ids = {
-                m['ref']
-                for e in elements
-                if e['type'] == 'relation' and e['id'] == relation_id
-                for m in e['members']
-                if m['type'] == 'way'
-            }
-            way_elements = [e for e in elements if e['type'] == 'way' and e['id'] in member_way_ids]
-            if not way_elements:
+            member_ways, way_coords = await self._get_member_ways(relation_id, osm_change)
+            if not way_coords:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Relation is empty, which is not supported')
 
-            relation_way_members = {e['id'] for e in way_elements}
             union_grid_cells_set: set[Cell] = set()
 
-            for way in way_elements:
-                lats, lons = zip(*((nodes_map[n]['lat'], nodes_map[n]['lon']) for n in way['nodes'] if n in nodes_map))
+            for coords in way_coords.values():
+                lats, lons = zip(*coords)
                 union_grid_cells_set.update(
                     BoundingBox(minlat=min(lats), minlon=min(lons), maxlat=max(lats), maxlon=max(lons))
                     .extend(DOWNLOAD_RELATION_WAY_BB_EXPAND)
@@ -739,7 +787,7 @@ class Overpass:
             union_grid_cells = tuple(union_grid_cells_set)
         else:
             # in merge mode, members are set by the client
-            relation_way_members = set()
+            member_ways = []
 
             union_grid_cells = download_targets
 
@@ -782,16 +830,40 @@ class Overpass:
         turn_in_place_nodes = {e['id'] for e in turn_in_place_elements}
 
         for e in road_elements:
-            e['_member'] = e['id'] in relation_way_members
             e['_oneway'] = is_oneway(e['tags'])
             e['_roundabout'] = is_roundabout(e['tags'])
 
         road_elements, connected_ways_map, id_map = organize_ways(road_elements, turn_in_place_nodes)
 
+        if osm_change is not None:
+            # the ways of an osmChange file may be split parts of the OSM ways: resolve them by their geometry
+            segments = {e['id']: e['nodes'] for e in road_elements}
+            endpoint_index = build_endpoint_index(segments)
+
+            for way_id, way_nodes in osm_change.ways:
+                segment_ids = match_way_segments(way_id, way_nodes, segments, endpoint_index)
+                if segment_ids is not None:
+                    id_map[way_id] = segment_ids
+                else:
+                    # e.g., the OSM data has changed since the file was created
+                    id_map.pop(way_id, None)
+
+        member_way_ids: set[ElementId] = set()
+        # members of the osmChange file which are not available (anymore), e.g., deleted or not routable
+        unmatched_way_ids: list[int] = []
+
+        for way_id in member_ways:
+            segment_ids = id_map.get(way_id)
+            if not segment_ids:
+                if osm_change is not None and way_id not in unmatched_way_ids:
+                    unmatched_way_ids.append(way_id)
+                continue
+            member_way_ids.update(segment_ids)
+
         ways = {
             e['id']: FetchRelationElement(
                 id=e['id'],
-                member=e['_member'],
+                member=e['id'] in member_way_ids,
                 oneway=e['_oneway'],
                 roundabout=e['_roundabout'],
                 nodes=e['nodes'],
@@ -817,7 +889,7 @@ class Overpass:
         global_bb = BoundingBox(*bbc.idx.bounds)
         download_triggers = get_download_triggers(bbc, union_grid_cells, ways)
 
-        return global_bb, download_hist, download_triggers, ways, id_map, bus_stop_collections
+        return global_bb, download_hist, download_triggers, ways, id_map, bus_stop_collections, unmatched_way_ids
 
     @cached(TTLCache(maxsize=128, ttl=60))
     async def query_parents(self, way_ids_set: frozenset[int]) -> QueryParentsResult:

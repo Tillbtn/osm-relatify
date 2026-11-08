@@ -11,6 +11,8 @@ const busAnimationElement = document.getElementById("bus-animation")
 const loadRelationForm = document.getElementById("load-relation-form")
 const loadRelationBtn = loadRelationForm.querySelector("button[type=submit]")
 const relationIdInput = loadRelationForm.querySelector("input[name=relation-id]")
+const loadOscInput = document.getElementById("load-osc-input")
+const loadOscBtn = document.getElementById("load-osc-btn")
 const relationIdElements = document.querySelectorAll(".view .relation-id")
 const relationUrlElements = document.querySelectorAll(".view .relation-url")
 const editBackBtn = document.querySelector("#view-edit .btn-back")
@@ -45,13 +47,14 @@ relationIdInput.addEventListener("input", (e) => {
     e.target.value = match !== null ? match[0] : ""
 })
 
-loadRelationForm.addEventListener("submit", (e) => {
-    e.preventDefault()
-
+// osmChange: the text of a .osc file whose relation members replace the current ones
+const loadRelation = async (id, osmChange = null) => {
     if (loadRelationBtn.classList.contains("is-loading")) return
 
-    relationId = Number.parseInt(relationIdInput.value)
+    relationId = id
+    relationIdInput.value = `${relationId}`
     relationIdInput.disabled = true
+    loadOscBtn.disabled = true
     loadRelationBtn.classList.add("btn-secondary")
     loadRelationBtn.classList.add("is-loading")
     loadRelationBtn.innerHTML = busAnimationElement.innerHTML
@@ -61,14 +64,16 @@ loadRelationForm.addEventListener("submit", (e) => {
     for (const relationUrlElement of relationUrlElements)
         relationUrlElement.href = `https://www.openstreetmap.org/relation/${relationId}`
 
+    const body = { relationId: relationId }
+    if (osmChange !== null) body.osmChange = osmChange
+
     fetch("/query", {
         method: "POST",
         headers: {
+            "Content-Encoding": "deflate",
             "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-            relationId: relationId,
-        }),
+        body: await deflateCompress(body),
     })
         .then(async (resp) => {
             if (!resp.ok) {
@@ -82,6 +87,13 @@ loadRelationForm.addEventListener("submit", (e) => {
             if (!data) return
 
             processFetchRelationData(data)
+
+            if (data.unmatchedWays?.length > 0)
+                showMessage(
+                    "warning",
+                    "⚠️ Some ways of the file were not loaded",
+                    `These member ways are missing now, because they were changed or deleted on OpenStreetMap since, or are not routable: ${data.unmatchedWays.join(", ")}`,
+                )
         })
         .catch((error) => {
             console.error(error)
@@ -89,10 +101,48 @@ loadRelationForm.addEventListener("submit", (e) => {
         })
         .finally(() => {
             relationIdInput.disabled = false
+            loadOscBtn.disabled = false
             loadRelationBtn.classList.remove("btn-secondary")
             loadRelationBtn.classList.remove("is-loading")
             loadRelationBtn.innerHTML = "Load"
         })
+}
+
+loadRelationForm.addEventListener("submit", (e) => {
+    e.preventDefault()
+    loadRelation(Number.parseInt(relationIdInput.value))
+})
+
+// relatify lists the edited relation last, after the relations updated because of split ways
+const getOsmChangeRelationId = (text) => {
+    const doc = new DOMParser().parseFromString(text, "application/xml")
+    if (doc.querySelector("parsererror") || doc.documentElement.nodeName !== "osmChange") return null
+
+    const relationIds = Array.from(doc.querySelectorAll("osmChange > modify > relation"))
+        .map((relation) => Number.parseInt(relation.getAttribute("id"), 10))
+        .filter((id) => id > 0)
+
+    return relationIds.at(-1) ?? null
+}
+
+loadOscBtn.onclick = () => {
+    loadOscInput.value = ""
+    loadOscInput.click()
+}
+
+loadOscInput.addEventListener("change", async () => {
+    const file = loadOscInput.files[0]
+    if (!file) return
+
+    const text = await file.text()
+    const id = getOsmChangeRelationId(text)
+
+    if (id === null) {
+        showMessage("danger", "❌ Invalid .osc file", "The file does not modify an existing relation.")
+        return
+    }
+
+    loadRelation(id, text)
 })
 
 export const processFetchRelationData = (data) => {

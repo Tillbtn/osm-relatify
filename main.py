@@ -42,6 +42,7 @@ from models.fetch_relation import (
     find_start_stop_ways,
 )
 from models.final_route import FinalRoute, WarningSeverity
+from models.osm_change import parse_osm_change
 from openstreetmap import OpenStreetMap
 from overpass import Overpass
 from relation_builder import build_osm_change, get_relation_members, sort_and_upgrade_members
@@ -146,6 +147,8 @@ class PostQueryModel(BaseModel):
     downloadHistory: dict | None = None
     downloadTargets: tuple[dict, ...] | None = None
     reload: bool = False
+    # an osmChange file (e.g., downloaded from relatify before), its relation members replace the OSM ones
+    osmChange: str | None = None
 
 
 @app.post('/query')
@@ -167,6 +170,12 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
         download_hist = None
         download_targets = None
 
+    osm_change = None
+    if model.osmChange is not None:
+        if download_targets is not None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, 'An osmChange file can only be used for the initial load')
+        osm_change = parse_osm_change(model.osmChange, model.relationId)
+
     with print_run_time('Querying relation data'):
         try:
             relation = await _OSM.get_relation(model.relationId)
@@ -180,18 +189,30 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
         if route_type is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, 'Relation must be a PTv2 bus/tram/trolleybus route')
 
-        bounds, download_hist, download_triggers, ways, id_map, bus_stop_collections = await _OVERPASS.query_relation(
+        (
+            bounds,
+            download_hist,
+            download_triggers,
+            ways,
+            id_map,
+            bus_stop_collections,
+            unmatched_way_ids,
+        ) = await _OVERPASS.query_relation(
             relation_id=model.relationId,
             download_hist=download_hist,
             download_targets=download_targets,
             route_type=route_type,
+            osm_change=osm_change,
         )
 
+    # the members of the osmChange file replace the current ones
+    members_relation = relation if osm_change is None else {**relation, 'members': osm_change.members_json()}
+
     with print_run_time('Finding start/stop ways'):
-        start_way, stop_way = find_start_stop_ways(ways, id_map, relation)
+        start_way, stop_way = find_start_stop_ways(ways, id_map, members_relation)
 
     with print_run_time('Assigning members for stops'):
-        bus_stop_collections = assign_none_members(bus_stop_collections, relation)
+        bus_stop_collections = assign_none_members(bus_stop_collections, members_relation)
 
     return FetchRelation(
         fetchMerge=len(download_hist.history) > 1 or model.reload,
@@ -204,6 +225,7 @@ async def post_query(model: PostQueryModel, _=Depends(require_user_details)):
         stopWay=stop_way,
         ways=ways,
         busStops=bus_stop_collections,
+        unmatchedWays=unmatched_way_ids,
     )
 
 
